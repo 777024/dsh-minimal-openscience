@@ -37,6 +37,7 @@ A notable signature we observed in DeepSeek CoT traces is a high frequency of **
   - `strict` — allowlist: `bash`, `edit`, `write`, `read`, `xd`
 - **Skills via `xd://skills`** — no skills injected into the system prompt
 - **Persistent state** — mode survives session restarts
+- **Auto-enable on DeepSeek** — if no manual state has been set and the active model is a DeepSeek model, minimal mode is enabled automatically and a TUI notification explains why
 - **No runtime dependencies**, no `any`, minimal structural types
 
 ## Installation
@@ -78,6 +79,18 @@ extensions:
 | `/dsh-minimal minimal` or `/dsh-minimal on` | Enable minimal mode |
 | `/dsh-minimal strict` | Enable strict mode |
 | `/dsh-minimal off` | Disable |
+
+### Auto-enable on DeepSeek
+
+If you have never run `/dsh-minimal` in the current session, the plugin checks the active model on each provider request. When the model id, provider, or name contains `deepseek`, it automatically enables `minimal` mode and shows a TUI notification like:
+
+```text
+dsh-minimal auto-enabled (minimal): detected deepseek-v4-flash, discovery protocol active
+```
+
+This is a convenience for DeepSeek users: you can start a session with a DeepSeek model and immediately get the minimal-prompt behavior without typing `/dsh-minimal` first.
+
+Manual state always wins. If you run `/dsh-minimal off`, the plugin records that as your explicit choice and will not auto-enable again until you remove the state or start a fresh session.
 
 Example discovery flow:
 

@@ -16,6 +16,9 @@
  * `payload.tools` in place (verified: mutation alone is honored, no return
  * value needed). State persists as a `com.dsh-minimal.state` custom session
  * entry so it survives session restart; the last entry wins.
+ *
+ * Auto-enable: when no manual state exists and the active model is a DeepSeek
+ * model, minimal mode is enabled automatically and the user is notified in TUI.
  */
 
 import { readdirSync, readFileSync, existsSync } from 'node:fs'
@@ -119,7 +122,7 @@ function scanSkills(cwd: string): SkillInfo[] {
 interface Entry {
   type: string
   customType?: string
-  data?: { mode?: Mode; enabled?: boolean }
+  data?: { mode?: Mode; enabled?: boolean; auto?: boolean }
 }
 
 interface SessionManager {
@@ -128,6 +131,11 @@ interface SessionManager {
 
 interface Ctx {
   sessionManager?: SessionManager
+  model?: { id?: string; provider?: string; name?: string }
+  models?: {
+    current?(): { id?: string; provider?: string; name?: string } | undefined
+  }
+  ui?: { notify(text: string, level?: string): unknown }
 }
 
 interface CommandCtx extends Ctx {
@@ -192,6 +200,28 @@ function readMode(sessionManager: SessionManager | undefined): Mode {
     }
   }
   return mode
+}
+
+function hasModeEntry(sessionManager: SessionManager | undefined): boolean {
+  if (!sessionManager) return false
+  return sessionManager.getBranch().some(
+    (entry) => entry.type === 'custom' && entry.customType === STATE_ENTRY,
+  )
+}
+
+function isDeepSeekModel(ctx: Ctx | undefined): boolean {
+  const model = ctx?.model ?? ctx?.models?.current?.()
+  if (!model) return false
+  const haystack = [model.id, model.provider, model.name]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+  return haystack.includes('deepseek')
+}
+
+function autoModeNotice(model: { id?: string; provider?: string; name?: string } | undefined): string {
+  const label = model?.id ?? model?.name ?? 'DeepSeek model'
+  return `dsh-minimal auto-enabled (minimal): detected ${label}, discovery protocol active`
 }
 
 function parseMode(args: string, current: Mode): Mode {
@@ -309,8 +339,20 @@ export default function (pi: Pi) {
   })
 
   pi.on('before_provider_request', (event, ctx) => {
-    const mode = readMode(ctx?.sessionManager)
-    if (mode === 'off') return
-    applyMode(event, mode)
+    // If the user has ever explicitly set dsh-minimal state, respect that
+    // manual state (including an explicit `off`).
+    if (hasModeEntry(ctx?.sessionManager)) {
+      const mode = readMode(ctx?.sessionManager)
+      if (mode === 'off') return
+      applyMode(event, mode)
+      return
+    }
+
+    // No manual state yet: auto-enable minimal mode when a DeepSeek model is used.
+    if (!isDeepSeekModel(ctx)) return
+
+    pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
+    ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+    applyMode(event, 'minimal')
   })
 }
