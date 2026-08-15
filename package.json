@@ -1,0 +1,21 @@
+{
+  "name": "omp-dsh-minimal",
+  "version": "0.1.0",
+  "description": "DSH-style minimal mode for omp: one-line system prompt + xd capability discovery.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "extension",
+    "plugin",
+    "dsh",
+    "deepseek-harness",
+    "minimal-prompt"
+  ],
+  "omp": {
+    "extensions": [
+      "./dsh-minimal.ts"
+    ]
+  }
+}
