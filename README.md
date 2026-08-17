@@ -82,7 +82,7 @@ extensions:
 
 ### Auto-enable on DeepSeek
 
-If you have never run `/dsh-minimal` in the current session, the plugin checks the active model on each provider request. When the model id, provider, or name contains `deepseek`, it automatically enables `minimal` mode and shows a TUI notification like:
+If you have never run `/dsh-minimal` in the current session, the plugin checks the active model on each agent start (with a provider-request fallback for side-channel flows). When the model id, provider, or name contains `deepseek`, it automatically enables `minimal` mode and shows a TUI notification like:
 
 ```text
 dsh-minimal auto-enabled (minimal): detected deepseek-v4-flash, discovery protocol active

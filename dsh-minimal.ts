@@ -12,10 +12,15 @@
  * mounts under xd:// automatically): `write xd://skills {"action":"list"}`
  * enumerates skills and `{"action":"read","name":"<name>"}` loads SKILL.md.
  *
- * Mechanism: `before_provider_request` mutates `payload.instructions` and
- * `payload.tools` in place (verified: mutation alone is honored, no return
- * value needed). State persists as a `com.dsh-minimal.state` custom session
- * entry so it survives session restart; the last entry wins.
+ * Mechanism: `before_agent_start` replaces `systemPrompt` once, before omp
+ * serializes it into each provider's request shape (anthropic `system`,
+ * openai-completions `messages`, openai-responses `input`/`instructions`).
+ * `before_provider_request` is a payload-level fallback for flows that bypass
+ * that hook: it patches `instructions`/`system`/`messages`/`input` in place,
+ * and also shortens/filters `payload.tools` (verified: mutation alone is
+ * honored, no return value needed). State persists as a
+ * `com.dsh-minimal.state` custom session entry so it survives session
+ * restart; the last entry wins.
  *
  * Auto-enable: when no manual state exists and the active model is a DeepSeek
  * model, minimal mode is enabled automatically and the user is notified in TUI.
@@ -248,32 +253,83 @@ interface ToolLike {
   description?: unknown
 }
 
-function applyMode(event: unknown, mode: Mode): void {
-  const payload = (event as { payload?: { instructions?: unknown; tools?: unknown } }).payload
-  if (!payload) return
-  if (typeof payload.instructions === 'string') {
-    payload.instructions = MINIMAL_SYSTEM
+function isToolLike(tool: unknown): tool is ToolLike {
+  return typeof tool === 'object' && tool !== null && 'name' in tool
+}
+
+function isSystemLikeMessage(msg: unknown): msg is { role: string; content?: unknown } {
+  if (typeof msg !== 'object' || msg === null || !('role' in msg)) return false
+  return typeof msg.role === 'string' && (msg.role === 'system' || msg.role === 'developer')
+}
+
+function replaceSystemMessages(messages: unknown[]): void {
+  let found = false
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+    if (!isSystemLikeMessage(msg)) continue
+    if (!found) {
+      found = true
+      msg.content = MINIMAL_SYSTEM
+    } else {
+      messages.splice(i, 1)
+      i--
+    }
   }
+  if (!found) messages.unshift({ role: 'system', content: MINIMAL_SYSTEM })
+}
+
+function applySystemPrompt(event: unknown): void {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return
+  const payload = event.payload
+  if (typeof payload !== 'object' || payload === null) return
+
+  // OpenAI-style payloads: top-level `instructions` string.
+  if ('instructions' in payload && typeof payload.instructions === 'string') {
+    payload.instructions = MINIMAL_SYSTEM
+  } else if ('system' in payload && Array.isArray(payload.system)) {
+    // Anthropic-style payloads: `system` as an array of text blocks.
+    payload.system = [{ type: 'text', text: MINIMAL_SYSTEM }]
+  } else if ('system' in payload && typeof payload.system === 'string') {
+    payload.system = MINIMAL_SYSTEM
+  }
+
+  // openai-completions: `messages` array with role=system/developer.
+  if ('messages' in payload && Array.isArray(payload.messages)) {
+    replaceSystemMessages(payload.messages)
+  }
+
+  // openai-responses: `input` array with role=system/developer.
+  if ('input' in payload && Array.isArray(payload.input)) {
+    replaceSystemMessages(payload.input)
+  }
+}
+
+function applyTools(event: unknown, mode: Mode): void {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return
+  const payload = event.payload
+  if (typeof payload !== 'object' || payload === null || !('tools' in payload)) return
   if (!Array.isArray(payload.tools)) return
   let tools = payload.tools
   if (mode === 'strict') {
     tools = tools.filter(
       (tool): tool is ToolLike =>
-        typeof tool === 'object' &&
-        tool !== null &&
-        typeof (tool as ToolLike).name === 'string' &&
-        STRICT_TOOLS.has((tool as ToolLike).name as string),
+        isToolLike(tool) &&
+        typeof tool.name === 'string' &&
+        STRICT_TOOLS.has(tool.name),
     )
     payload.tools = tools
   }
   for (const tool of tools) {
-    if (typeof tool !== 'object' || tool === null) continue
-    const t = tool as ToolLike
-    if (typeof t.name === 'string') {
-      const short = SHORT_DESCRIPTIONS[t.name]
-      if (short) t.description = short
-    }
+    if (!isToolLike(tool)) continue
+    if (typeof tool.name !== 'string') continue
+    const short = SHORT_DESCRIPTIONS[tool.name]
+    if (short) tool.description = short
   }
+}
+
+function applyMode(event: unknown, mode: Mode): void {
+  applySystemPrompt(event)
+  applyTools(event, mode)
 }
 
 function renderSkillList(skills: SkillInfo[]): string {
@@ -338,21 +394,32 @@ export default function (pi: Pi) {
     },
   })
 
-  pi.on('before_provider_request', (event, ctx) => {
+  pi.on('before_agent_start', (event, ctx) => {
     // If the user has ever explicitly set dsh-minimal state, respect that
     // manual state (including an explicit `off`).
-    if (hasModeEntry(ctx?.sessionManager)) {
-      const mode = readMode(ctx?.sessionManager)
-      if (mode === 'off') return
-      applyMode(event, mode)
-      return
+    let mode = readMode(ctx?.sessionManager)
+    if (!hasModeEntry(ctx?.sessionManager) && isDeepSeekModel(ctx)) {
+      // No manual state yet: auto-enable minimal mode when a DeepSeek model is used.
+      pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
+      ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+      mode = 'minimal'
     }
+    if (mode === 'off') return
+    return { systemPrompt: MINIMAL_SYSTEM }
+  })
 
-    // No manual state yet: auto-enable minimal mode when a DeepSeek model is used.
-    if (!isDeepSeekModel(ctx)) return
-
-    pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
-    ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
-    applyMode(event, 'minimal')
+  pi.on('before_provider_request', (event, ctx) => {
+    let mode = readMode(ctx?.sessionManager)
+    if (!hasModeEntry(ctx?.sessionManager) && isDeepSeekModel(ctx)) {
+      // Fallback auto-enable for provider requests that bypass before_agent_start.
+      pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
+      ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+      mode = 'minimal'
+    }
+    if (mode === 'off') return
+    // before_agent_start already replaces systemPrompt at the provider-neutral
+    // layer; this payload-level pass is a fallback for flows that bypass that
+    // hook (e.g. side-channel/streaming requests), and also patches tools.
+    applyMode(event, mode)
   })
 }
