@@ -3,14 +3,14 @@
  *
  * `/dsh-minimal` toggles the legacy minimal mode; `strict` narrows tools,
  * and `pro` performs a DeepSeek V4 Pro two-stage bootstrap:
- *
- * 1. The first user turn is intercepted and replaced with a short warmup
- *    prompt ("Use bash to echo yes."). The warmup request carries exactly the
- *    DSH Minimal tools: bash + str_replace_editor.
- * 2. After the warmup run ends, the original user prompt is re-sent with the
- *    full omp tool set restored, so the real request can dispatch subagents,
- *    search the web, or call any other tool it needs.
- *
+ * 1. The first user turn is intercepted and replaced with the one-line
+ *    system prompt ("You are a helpful software engineer assistant.") while
+ *    only the DSH Minimal bash/str_replace_editor pair is exposed.
+ * 2. After the warmup run ends, the original user prompt is handed back with
+ *    the task-needed tool set (task, hub, web_search) inside a short
+ *    cooperative frame ("We need to handle the following request together.").
+ *    This keeps the model's CoT in the collaborative "we need / let's" style
+ *    while the real request still gets the tools it needs.
  * The plugin also registers `xd` and `skills` for on-demand capability
  * discovery. Pro mode never injects an extra prime message into the provider
  * payload: the warmup prompt IS the first user message.
@@ -27,7 +27,7 @@ import { homedir } from 'node:os'
 const STATE_ENTRY = 'com.dsh-minimal.state'
 const WARMUP_ENTRY = 'com.dsh-minimal.warmup'
 const MINIMAL_SYSTEM = 'You are a helpful software engineer assistant.'
-const WARMUP_PROMPT = 'Use bash to echo yes.'
+const WARMUP_PROMPT = MINIMAL_SYSTEM
 const PRO_EDITOR = 'str_replace_editor'
 
 /** Strict-mode tool allowlist: bash + editing trio + the xd discovery device. */
@@ -35,6 +35,8 @@ const STRICT_TOOLS = new Set(['bash', 'edit', 'write', 'read', 'xd'])
 
 /** The official DSH Minimal first-request tool names. */
 const PRO_BOOTSTRAP_TOOLS = ['bash', PRO_EDITOR]
+const PRO_PROMOTE_TOOLS = new Set(['task', 'hub', 'web_search'])
+const HANDOFF_PREFIX = 'We need to handle the following request together.\n\n'
 
 /** Official DSH Minimal persistent-bash JSON schema (transport-neutral). */
 const DSH_MINIMAL_BASH_SCHEMA = {
@@ -368,7 +370,7 @@ function parseMode(args: string, current: Mode): Mode {
 function modeNotice(mode: Mode): string {
   if (mode === 'minimal') return `dsh-minimal enabled (minimal): discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
   if (mode === 'strict') return `dsh-minimal strict: only bash/edit/write/read, discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
-  if (mode === 'pro') return `dsh-minimal pro: warmup "${WARMUP_PROMPT}" runs with ${PRO_BOOTSTRAP_TOOLS.join(' + ')}, then the original prompt runs with the full omp tool set`
+  if (mode === 'pro') return `dsh-minimal pro: warmup "${WARMUP_PROMPT}" runs with ${PRO_BOOTSTRAP_TOOLS.join(' + ')}, then the original prompt runs with ${[...PRO_PROMOTE_TOOLS].join(' + ')} and a cooperative handoff`
   return 'dsh-minimal disabled: default system prompt and tool descriptions restored'
 }
 interface ToolLike {
@@ -799,20 +801,20 @@ export default function (pi: Pi) {
       pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
       return
     }
-    // Warmup is complete: promote now so the original prompt runs with the
-    // full omp tool set (subagent dispatch, web_search, etc. must be visible
-    // for the real request).
+    // Warmup is complete. Promote to the task-needed tool set and hand the
+    // original prompt over inside a short cooperative frame.
     const state = readProState(ctx?.sessionManager)
     const savedTools = Array.isArray(state.activeTools) ? state.activeTools : allToolNames()
+    const promoteTools = savedTools.filter((name) => PRO_PROMOTE_TOOLS.has(name))
     pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: savedTools, promoteOn: state.promoteOn ?? 'tool-call' })
     pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
-    if (savedTools.length > 0) await pi.setActiveTools?.(savedTools)
-    const content: unknown[] = [{ type: 'text', text: prompt }]
+    if (promoteTools.length > 0) await pi.setActiveTools?.(promoteTools)
+    const content: unknown[] = [{ type: 'text', text: `${HANDOFF_PREFIX}${prompt}` }]
     if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
     if (deliverAs) pi.sendUserMessage?.(content, { deliverAs })
     else pi.sendUserMessage?.(content)
     warmupImages = undefined
-    ctx?.ui?.notify?.('dsh-minimal pro warmup complete: sending your original prompt with the full omp tool set', 'info')
+    ctx?.ui?.notify?.(`dsh-minimal pro warmup complete: sending your original prompt with the task tool set (${promoteTools.join(', ') || 'none'})`, 'info')
   }
 
   pi.on('input', (event, ctx) => {
