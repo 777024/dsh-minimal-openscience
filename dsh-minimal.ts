@@ -1,40 +1,112 @@
 /**
  * DSH-style minimal mode for omp.
  *
- * `/dsh-minimal` toggles a single-sentence system prompt plus an on-demand
- * capability-discovery protocol (read xd:// to enumerate tool devices, read
- * xd://<tool> for docs/schema, write JSON to xd://<tool> to execute), so the
- * system prompt never needs a tool catalog again. `/dsh-minimal strict`
- * additionally narrows tools to bash/edit/write/read. Modeled on DeepSeek
- * Harness's `minimal` agent preset: the persona IS the complete system prompt.
+ * `/dsh-minimal` toggles the legacy minimal mode; `strict` narrows tools,
+ * and `pro` performs a DeepSeek V4 Pro bootstrap compatible with DSH Minimal:
+ * the first provider request uses the one-line prompt plus payload-only fake
+ * `bash` and `str_replace_editor` tools whose schemas are byte-identical to
+ * the official DSH Minimal preset. Calling either fake tool returns an error
+ * and promotes the session, after which the original omp tool set is restored.
  *
- * The plugin also registers a `skills` device (loadMode "discoverable", so it
- * mounts under xd:// automatically): `write xd://skills {"action":"list"}`
- * enumerates skills and `{"action":"read","name":"<name>"}` loads SKILL.md.
+ * The plugin also registers `xd` and `skills` for on-demand capability
+ * discovery. Pro mode never injects an echo/bootstrap hint: strict parity with
+ * DSH Minimal means the first request contains no extra instruction.
  *
- * Mechanism: `before_agent_start` replaces `systemPrompt` once, before omp
- * serializes it into each provider's request shape (anthropic `system`,
- * openai-completions `messages`, openai-responses `input`/`instructions`).
- * `before_provider_request` is a payload-level fallback for flows that bypass
- * that hook: it patches `instructions`/`system`/`messages`/`input` in place,
- * and also shortens/filters `payload.tools` (verified: mutation alone is
- * honored, no return value needed). State persists as a
- * `com.dsh-minimal.state` custom session entry so it survives session
- * restart; the last entry wins.
- *
- * Auto-enable: when no manual state exists and the active model is a DeepSeek
- * model, minimal mode is enabled automatically and the user is notified in TUI.
+ * `before_provider_request` patches provider payloads in place, while session
+ * entries persist mode and Pro phase across resume/restart.
  */
 
-import { readdirSync, readFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join, resolve, relative } from 'node:path'
 import { homedir } from 'node:os'
 
 const STATE_ENTRY = 'com.dsh-minimal.state'
 const MINIMAL_SYSTEM = 'You are a helpful software engineer assistant.'
+const PRO_EDITOR = 'str_replace_editor'
 
 /** Strict-mode tool allowlist: bash + editing trio + the xd discovery device. */
 const STRICT_TOOLS = new Set(['bash', 'edit', 'write', 'read', 'xd'])
+
+/** The official DSH Minimal first-request tool names. */
+const PRO_BOOTSTRAP_TOOLS = ['bash', PRO_EDITOR]
+
+/** Official DSH Minimal persistent-bash JSON schema (transport-neutral). */
+const DSH_MINIMAL_BASH_SCHEMA = {
+  type: 'object',
+  properties: {
+    command: {
+      type: 'string',
+      description: 'The bash command to run. Relative path is preferred in the command.',
+    },
+  },
+  required: ['command'],
+}
+
+/** Official DSH Minimal persistent-bash tool schema, byte-identical for bootstrap. */
+const DSH_MINIMAL_BASH = {
+  name: 'bash',
+  description:
+    'Run commands in a persistent bash shell. ' +
+    'State, including the current directory and exported environment variables, ' +
+    'persists across calls for this agent.',
+  parameters: DSH_MINIMAL_BASH_SCHEMA,
+  input_schema: DSH_MINIMAL_BASH_SCHEMA,
+}
+
+/** Official DSH Minimal str_replace_editor JSON schema (transport-neutral). */
+const DSH_MINIMAL_EDITOR_SCHEMA = {
+  type: 'object',
+  properties: {
+    command: {
+      type: 'string',
+      description: 'The commands to run. Allowed options are: `view`, `create`, `str_replace`, `insert`.',
+      enum: ['view', 'create', 'str_replace', 'insert'],
+    },
+    path: {
+      type: 'string',
+      description: 'Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.',
+    },
+    file_text: {
+      type: 'string',
+      description: 'Required parameter of `create` command, with the content of the file to be created.',
+    },
+    insert_line: {
+      type: 'integer',
+      description: 'Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`.',
+    },
+    new_str: {
+      type: 'string',
+      description: 'Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert.',
+    },
+    old_str: {
+      type: 'string',
+      description: 'Required parameter of `str_replace` command containing the string in `path` to replace.',
+    },
+    view_range: {
+      type: 'array',
+      description: 'Optional parameter of `view` command when `path` points to a file. If none is given, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.',
+      items: { type: 'integer' },
+    },
+  },
+  required: ['command', 'path'],
+}
+
+/** Official DSH Minimal str_replace_editor tool schema, byte-identical for bootstrap. */
+const DSH_MINIMAL_EDITOR = {
+  name: 'str_replace_editor',
+  description: `Custom editing tool for viewing, creating and editing files
+* State is persistent across command calls and discussions with the user
+* If \`path\` is a file, \`view\` displays the result of applying \`cat -n\`. If \`path\` is a directory, \`view\` lists non-hidden files and directories up to 2 levels deep
+* The \`create\` command cannot be used if the specified \`path\` already exists as a file
+* If a \`command\` generates a long output, it will be truncated and marked with \`<response clipped>\`
+
+Notes for using the \`str_replace\` command:
+* The \`old_str\` parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
+* If the \`old_str\` parameter is not unique in the file, the replacement will not be performed. Make sure to include enough context in \`old_str\` to make it unique
+* The \`new_str\` parameter should contain the edited lines that should replace the \`old_str\``,
+  parameters: DSH_MINIMAL_EDITOR_SCHEMA,
+  input_schema: DSH_MINIMAL_EDITOR_SCHEMA,
+}
 
 /** One-line descriptions replacing the verbose built-ins when a mode is active.
  *  read/write carry the xd:// discovery protocol so it stays out of the system prompt. */
@@ -52,7 +124,8 @@ const SHORT_DESCRIPTIONS: Record<string, string> = {
   web_search: 'Search the web for current information.',
 }
 
-type Mode = 'off' | 'minimal' | 'strict'
+type Mode = 'off' | 'minimal' | 'strict' | 'pro'
+
 
 // ---- skill scanning (standard provider roots, first name wins) -------------
 
@@ -97,21 +170,13 @@ function scanSkills(cwd: string): SkillInfo[] {
   const out: SkillInfo[] = []
   for (const root of skillRoots(cwd)) {
     let entries
-    try {
-      entries = readdirSync(root, { withFileTypes: true })
-    } catch {
-      continue
-    }
+    try { entries = readdirSync(root, { withFileTypes: true }) } catch { continue }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
       const skillMd = join(root, entry.name, 'SKILL.md')
       if (!existsSync(skillMd)) continue
       let body: string
-      try {
-        body = readFileSync(skillMd, 'utf8')
-      } catch {
-        continue
-      }
+      try { body = readFileSync(skillMd, 'utf8') } catch { continue }
       const fm = parseFrontmatter(body)
       const name = fm.name ?? entry.name
       if (seen.has(name)) continue
@@ -121,13 +186,25 @@ function scanSkills(cwd: string): SkillInfo[] {
   }
   return out
 }
-
-// ---- minimal structural types (no runtime dependency on the host package) ----
-
 interface Entry {
   type: string
   customType?: string
-  data?: { mode?: Mode; enabled?: boolean; auto?: boolean }
+  data?: { mode?: Mode; enabled?: boolean; auto?: boolean; phase?: 'bootstrap' | 'promoted'; activeTools?: string[]; promoteOn?: 'tool-call' | 'assistant-message' | 'either' }
+}
+
+interface ToolParams {
+  action: 'list' | 'read'
+  name?: string
+}
+
+interface EditorParams {
+  command: 'view' | 'create' | 'str_replace' | 'insert'
+  path: string
+  file_text?: string
+  old_str?: string
+  new_str?: string
+  insert_line?: number
+  view_range?: number[]
 }
 
 interface SessionManager {
@@ -137,9 +214,7 @@ interface SessionManager {
 interface Ctx {
   sessionManager?: SessionManager
   model?: { id?: string; provider?: string; name?: string }
-  models?: {
-    current?(): { id?: string; provider?: string; name?: string } | undefined
-  }
+  models?: { current?(): { id?: string; provider?: string; name?: string } | undefined }
   ui?: { notify(text: string, level?: string): unknown }
 }
 
@@ -147,14 +222,7 @@ interface CommandCtx extends Ctx {
   ui: { notify(text: string, level?: string): unknown }
 }
 
-interface ToolParams {
-  action: 'list' | 'read'
-  name?: string
-}
-
-interface ToolContext {
-  cwd: string
-}
+interface ToolContext { cwd: string }
 
 interface ToolResult {
   content: { type: 'text'; text: string }[]
@@ -164,29 +232,24 @@ interface ToolResult {
 
 interface Pi {
   on(event: string, handler: (event: unknown, ctx?: Ctx) => void | Promise<void>): unknown
-  registerCommand(
-    name: string,
-    def: { description: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> },
-  ): unknown
+  registerCommand(name: string, def: { description: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }): unknown
   registerTool(def: {
     name: string
     label?: string
     description: string
     parameters: unknown
     loadMode?: string
-    execute(
-      id: string,
-      params: ToolParams,
-      signal: unknown,
-      onUpdate: unknown,
-      ctx: ToolContext,
-    ): Promise<ToolResult>
+    execute(id: string, params: ToolParams | EditorParams, signal: unknown, onUpdate: unknown, ctx: ToolContext): Promise<ToolResult>
   }): unknown
   appendEntry(type: string, data: unknown): unknown
+  getActiveTools?(): string[]
+  setActiveTools?(toolNames: string[]): Promise<void>
   zod: {
     object: (shape: Record<string, unknown>) => unknown
     enum: (values: readonly string[]) => unknown
     string: () => { optional: () => unknown }
+    number: () => { optional: () => unknown }
+    array: (value: unknown) => { optional: () => unknown }
   }
 }
 
@@ -196,37 +259,56 @@ function readMode(sessionManager: SessionManager | undefined): Mode {
   for (const entry of sessionManager.getBranch()) {
     if (entry.type !== 'custom' || entry.customType !== STATE_ENTRY) continue
     const data = entry.data
-    if (data?.mode === 'minimal' || data?.mode === 'strict') {
-      mode = data.mode
-    } else if (data?.enabled === true) {
-      mode = 'minimal' // legacy `{ enabled: true }` entries
-    } else {
-      mode = 'off'
-    }
+    if (data?.mode === 'minimal' || data?.mode === 'strict' || data?.mode === 'pro') mode = data.mode
+    else if (data?.enabled === true) mode = 'minimal'
+    else mode = 'off'
   }
   return mode
 }
 
+function readProState(sessionManager: SessionManager | undefined): { phase: 'bootstrap' | 'promoted'; activeTools?: string[]; promoteOn?: 'tool-call' | 'assistant-message' | 'either' } {
+  let state: { phase: 'bootstrap' | 'promoted'; activeTools?: string[]; promoteOn?: 'tool-call' | 'assistant-message' | 'either' } = { phase: 'bootstrap' }
+  for (const entry of sessionManager?.getBranch() ?? []) {
+    if (entry.type !== 'custom' || entry.customType !== STATE_ENTRY || entry.data?.mode !== 'pro') continue
+    if (entry.data.phase === 'promoted') state = { phase: 'promoted', activeTools: entry.data.activeTools, promoteOn: entry.data.promoteOn }
+    else if (entry.data.phase === 'bootstrap') state = { phase: 'bootstrap', activeTools: entry.data.activeTools, promoteOn: entry.data.promoteOn }
+  }
+  return state
+}
+
 function hasModeEntry(sessionManager: SessionManager | undefined): boolean {
-  if (!sessionManager) return false
-  return sessionManager.getBranch().some(
-    (entry) => entry.type === 'custom' && entry.customType === STATE_ENTRY,
-  )
+  return sessionManager?.getBranch().some((entry) => entry.type === 'custom' && entry.customType === STATE_ENTRY) ?? false
+}
+function isDeepSeekV4Pro(ctx: Ctx | undefined): boolean {
+  const model = ctx?.model ?? ctx?.models?.current?.()
+  const haystack = [model?.id, model?.provider, model?.name].filter(Boolean).join(' ').toLowerCase()
+  return haystack.includes('deepseek') && haystack.includes('v4') && haystack.includes('pro')
 }
 
 function isDeepSeekModel(ctx: Ctx | undefined): boolean {
   const model = ctx?.model ?? ctx?.models?.current?.()
   if (!model) return false
-  const haystack = [model.id, model.provider, model.name]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase()
+  const haystack = [model.id, model.provider, model.name].filter(Boolean).join(' ').toLowerCase()
   return haystack.includes('deepseek')
 }
 
 function autoModeNotice(model: { id?: string; provider?: string; name?: string } | undefined): string {
+  return `dsh-minimal auto-enabled (pro): detected ${model?.id ?? model?.name ?? 'DeepSeek V4 Pro'}, DSH Minimal-compatible bootstrap active`
+}
+
+function autoMinimalNotice(model: { id?: string; provider?: string; name?: string } | undefined): string {
   const label = model?.id ?? model?.name ?? 'DeepSeek model'
   return `dsh-minimal auto-enabled (minimal): detected ${label}, discovery protocol active`
+}
+
+function shouldAutoPro(sessionManager: SessionManager | undefined, ctx: Ctx | undefined): boolean {
+  if (!isDeepSeekV4Pro(ctx)) return false
+  const entries = sessionManager?.getBranch() ?? []
+  const last = [...entries].reverse().find((entry) => entry.type === 'custom' && entry.customType === STATE_ENTRY)
+  if (!last) return true
+  // Migrate the plugin's previous automatic DeepSeek-wide minimal state.
+  // Explicit user choices, including `/dsh-minimal minimal` or `off`, win.
+  return last.data?.auto === true && last.data.mode === 'minimal'
 }
 
 function parseMode(args: string, current: Mode): Mode {
@@ -234,20 +316,16 @@ function parseMode(args: string, current: Mode): Mode {
   if (value === 'off') return 'off'
   if (value === 'on' || value === 'minimal') return 'minimal'
   if (value === 'strict') return 'strict'
-  // bare toggle: off <-> minimal; strict falls back to off
+  if (value === 'pro') return 'pro'
   return current === 'off' ? 'minimal' : 'off'
 }
 
 function modeNotice(mode: Mode): string {
-  if (mode === 'minimal') {
-    return `dsh-minimal enabled (minimal): discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
-  }
-  if (mode === 'strict') {
-    return `dsh-minimal strict: only bash/edit/write/read, discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
-  }
+  if (mode === 'minimal') return `dsh-minimal enabled (minimal): discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
+  if (mode === 'strict') return `dsh-minimal strict: only bash/edit/write/read, discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
+  if (mode === 'pro') return `dsh-minimal pro: first request uses ${PRO_BOOTSTRAP_TOOLS.join(' + ')}, then restores the original omp tool set`
   return 'dsh-minimal disabled: default system prompt and tool descriptions restored'
 }
-
 interface ToolLike {
   name?: unknown
   description?: unknown
@@ -255,6 +333,54 @@ interface ToolLike {
 
 function isToolLike(tool: unknown): tool is ToolLike {
   return typeof tool === 'object' && tool !== null && 'name' in tool
+}
+
+function editorPath(cwd: string, path: string): string {
+  const target = resolve(cwd, path)
+  const root = resolve(cwd)
+  const rel = relative(root, target)
+  if (rel.startsWith('..') || rel.includes(':')) throw new Error('path must stay inside the current workspace')
+  return target
+}
+
+function editorResult(text: string, details?: unknown): ToolResult {
+  return { content: [{ type: 'text', text }], details }
+}
+
+function executeEditor(params: EditorParams, ctx: ToolContext): ToolResult {
+  const path = editorPath(ctx.cwd, params.path)
+  if (params.command === 'view') {
+    const body = readFileSync(path, 'utf8')
+    const lines = body.split(/\r?\n/)
+    let selected = lines
+    if (Array.isArray(params.view_range) && params.view_range.length >= 2) {
+      const start = params.view_range[0]
+      const end = params.view_range[1]
+      const startIdx = Math.max(0, start - 1)
+      const endIdx = end === -1 ? lines.length : Math.min(lines.length, end)
+      selected = lines.slice(startIdx, endIdx)
+    }
+    return editorResult(selected.map((line, index) => `${String(index + 1).padStart(4)}  ${line}`).join('\n'))
+  }
+  if (params.command === 'create') {
+    if (params.file_text === undefined) throw new Error('file_text is required for create')
+    mkdirSync(resolve(path, '..'), { recursive: true })
+    writeFileSync(path, params.file_text)
+    return editorResult(`Created ${params.path}`)
+  }
+  const body = readFileSync(path, 'utf8')
+  if (params.command === 'str_replace') {
+    if (params.old_str === undefined || params.new_str === undefined) throw new Error('old_str and new_str are required for str_replace')
+    const count = body.split(params.old_str).length - 1
+    if (count !== 1) throw new Error(`old_str must match exactly once; found ${count}`)
+    writeFileSync(path, body.replace(params.old_str, params.new_str))
+    return editorResult(`Updated ${params.path}`)
+  }
+  if (params.insert_line === undefined || params.new_str === undefined) throw new Error('insert_line and new_str are required for insert')
+  const lines = body.split(/\r?\n/)
+  lines.splice(Math.max(0, params.insert_line - 1), 0, params.new_str)
+  writeFileSync(path, lines.join('\n'))
+  return editorResult(`Updated ${params.path}`)
 }
 
 function isSystemLikeMessage(msg: unknown): msg is { role: string; content?: unknown } {
@@ -304,32 +430,203 @@ function applySystemPrompt(event: unknown): void {
   }
 }
 
-function applyTools(event: unknown, mode: Mode): void {
+type ProviderToolKind = 'anthropic' | 'openai-responses' | 'openai-completions' | 'unknown'
+
+function detectProviderToolKind(payload: unknown): ProviderToolKind {
+  if (typeof payload !== 'object' || payload === null) return 'unknown'
+  const tools = 'tools' in payload ? payload.tools : undefined
+  if (Array.isArray(tools) && tools.length > 0) {
+    const first = tools[0]
+    if (typeof first === 'object' && first !== null) {
+      if ('function' in first) return 'openai-completions'
+      if ('input_schema' in first) return 'anthropic'
+      if ('parameters' in first && 'name' in first) return 'openai-responses'
+    }
+  }
+  if ('system' in payload) return 'anthropic'
+  if ('input' in payload || 'instructions' in payload) return 'openai-responses'
+  if ('messages' in payload) return 'openai-completions'
+  return 'unknown'
+}
+
+function buildBootstrapTools(payload: unknown): unknown[] {
+  const kind = detectProviderToolKind(payload)
+  if (kind === 'openai-completions') {
+    return [
+      {
+        type: 'function',
+        function: {
+          name: DSH_MINIMAL_BASH.name,
+          description: DSH_MINIMAL_BASH.description,
+          parameters: DSH_MINIMAL_BASH.parameters,
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: DSH_MINIMAL_EDITOR.name,
+          description: DSH_MINIMAL_EDITOR.description,
+          parameters: DSH_MINIMAL_EDITOR.parameters,
+        },
+      },
+    ]
+  }
+  if (kind === 'anthropic') {
+    return [
+      {
+        name: DSH_MINIMAL_BASH.name,
+        description: DSH_MINIMAL_BASH.description,
+        input_schema: DSH_MINIMAL_BASH.input_schema,
+      },
+      {
+        name: DSH_MINIMAL_EDITOR.name,
+        description: DSH_MINIMAL_EDITOR.description,
+        input_schema: DSH_MINIMAL_EDITOR.input_schema,
+      },
+    ]
+  }
+  if (kind === 'openai-responses') {
+    return [
+      {
+        type: 'function',
+        name: DSH_MINIMAL_BASH.name,
+        description: DSH_MINIMAL_BASH.description,
+        parameters: DSH_MINIMAL_BASH.parameters,
+      },
+      {
+        type: 'function',
+        name: DSH_MINIMAL_EDITOR.name,
+        description: DSH_MINIMAL_EDITOR.description,
+        parameters: DSH_MINIMAL_EDITOR.parameters,
+      },
+    ]
+  }
+  // Unknown provider: keep both common schema fields so either style can read it.
+  return [
+    {
+      name: DSH_MINIMAL_BASH.name,
+      description: DSH_MINIMAL_BASH.description,
+      parameters: DSH_MINIMAL_BASH.parameters,
+      input_schema: DSH_MINIMAL_BASH.input_schema,
+    },
+    {
+      name: DSH_MINIMAL_EDITOR.name,
+      description: DSH_MINIMAL_EDITOR.description,
+      parameters: DSH_MINIMAL_EDITOR.parameters,
+      input_schema: DSH_MINIMAL_EDITOR.input_schema,
+    },
+  ]
+}
+
+function stripInjectedText(text: string): string {
+  return text
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .replace(/^\s*\[AGENTS\.md\][^\n]*\n?/gm, '')
+    .replace(/^\s*\[CLAUDE\.md\][^\n]*\n?/gm, '')
+    .replace(/^\s*# AGENTS\.md\s*$/gm, '')
+    .replace(/^\s*Available skills:[^\n]*\n(?:\s*[-*][^\n]*\n)*/gm, '')
+    .replace(/^\s*## Skills\s*\n(?:\s*[-*][^\n]*\n)*/gm, '')
+    .replace(/^\s*skill catalog[^\n]*\n?/gm, '')
+    .replace(/^\s*xd:\/\/skills[^\n]*\n?/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function stripBootstrapContext(event: unknown): void {
   if (typeof event !== 'object' || event === null || !('payload' in event)) return
   const payload = event.payload
-  if (typeof payload !== 'object' || payload === null || !('tools' in payload)) return
-  if (!Array.isArray(payload.tools)) return
+  if (typeof payload !== 'object' || payload === null) return
+  const messages = 'messages' in payload && Array.isArray(payload.messages)
+    ? payload.messages
+    : 'input' in payload && Array.isArray(payload.input)
+      ? payload.input
+      : []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (typeof msg !== 'object' || msg === null || !('content' in msg) || !('role' in msg)) continue
+    const role = msg.role
+    if (role !== 'user' && role !== 'system' && role !== 'developer') continue
+    const content = msg.content
+    if (typeof content === 'string') {
+      const cleaned = stripInjectedText(content)
+      if (!cleaned) messages.splice(i, 1)
+      else msg.content = cleaned
+    } else if (Array.isArray(content)) {
+      const cleanedBlocks = content.filter((block) => {
+        if (typeof block === 'object' && block !== null && 'type' in block && block.type === 'text' && 'text' in block) {
+          const text = block.text
+          if (typeof text !== 'string') return true
+          const cleaned = stripInjectedText(text)
+          if (!cleaned) return false
+          block.text = cleaned
+        }
+        return true
+      })
+      if (cleanedBlocks.length === 0) messages.splice(i, 1)
+      else msg.content = cleanedBlocks
+    }
+  }
+}
+
+function insertBootstrapPrime(event: unknown): void {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return
+  const payload = event.payload
+  if (typeof payload !== 'object' || payload === null) return
+  const messages = 'messages' in payload && Array.isArray(payload.messages)
+    ? payload.messages
+    : 'input' in payload && Array.isArray(payload.input)
+      ? payload.input
+      : []
+  if (messages.length === 0) return
+  // Only prime the very first request: once an assistant turn exists, stop.
+  const hasAssistant = messages.some((msg) => typeof msg === 'object' && msg !== null && 'role' in msg && msg.role === 'assistant')
+  if (hasAssistant) return
+
+  const isAnthropic = 'system' in payload
+  const prime = isAnthropic
+    ? { role: 'user', content: [{ type: 'text', text: MINIMAL_SYSTEM }] }
+    : { role: 'user', content: MINIMAL_SYSTEM }
+
+  let index = 0
+  while (index < messages.length) {
+    const msg = messages[index]
+    if (typeof msg === 'object' && msg !== null && 'role' in msg && (msg.role === 'system' || msg.role === 'developer')) {
+      index++
+    } else break
+  }
+  messages.splice(index, 0, prime)
+}
+
+function applyTools(event: unknown, mode: Mode, proPhase: 'bootstrap' | 'promoted' = 'promoted'): void {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return
+  const payload = event.payload as { tools?: unknown[] }
+  if (typeof payload !== 'object' || payload === null) return
+  if (mode === 'pro' && proPhase === 'bootstrap') {
+    // Bootstrap uses the real registered bash/str_replace_editor tools, but
+    // the model-visible payload is byte-identical to official DSH Minimal.
+    payload.tools = buildBootstrapTools(payload)
+    return
+  }
+  if (!('tools' in payload) || !Array.isArray(payload.tools)) return
   let tools = payload.tools
   if (mode === 'strict') {
-    tools = tools.filter(
-      (tool): tool is ToolLike =>
-        isToolLike(tool) &&
-        typeof tool.name === 'string' &&
-        STRICT_TOOLS.has(tool.name),
-    )
+    tools = tools.filter((tool): tool is ToolLike => isToolLike(tool) && typeof tool.name === 'string' && STRICT_TOOLS.has(tool.name))
     payload.tools = tools
   }
   for (const tool of tools) {
-    if (!isToolLike(tool)) continue
-    if (typeof tool.name !== 'string') continue
+    if (!isToolLike(tool) || typeof tool.name !== 'string') continue
     const short = SHORT_DESCRIPTIONS[tool.name]
     if (short) tool.description = short
   }
 }
 
-function applyMode(event: unknown, mode: Mode): void {
+function applyMode(event: unknown, mode: Mode, proPhase: 'bootstrap' | 'promoted' = 'promoted'): void {
+  if (mode === 'pro' && proPhase === 'bootstrap') {
+    stripBootstrapContext(event)
+    insertBootstrapPrime(event)
+  }
   applySystemPrompt(event)
-  applyTools(event, mode)
+  applyTools(event, mode, proPhase)
 }
 
 function renderSkillList(skills: SkillInfo[]): string {
@@ -337,89 +634,186 @@ function renderSkillList(skills: SkillInfo[]): string {
   return skills.map((s) => `- ${s.name}${s.description ? `: ${s.description}` : ''}`).join('\n')
 }
 
+function eventToolName(event: unknown): string | undefined {
+  if (typeof event !== 'object' || event === null) return undefined
+  const value = event as { toolName?: unknown; name?: unknown }
+  if (typeof value.toolName === 'string') return value.toolName
+  return typeof value.name === 'string' ? value.name : undefined
+}
+
+function hasToolCallInHistory(event: unknown): boolean {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return false
+  const payload = (event as { payload?: { messages?: unknown[]; input?: unknown[] } }).payload
+  if (!payload) return false
+  const messages = Array.isArray(payload.messages)
+    ? payload.messages
+    : Array.isArray(payload.input)
+      ? payload.input
+      : []
+  for (const msg of messages) {
+    if (typeof msg !== 'object' || msg === null || !('role' in msg)) continue
+    if (msg.role !== 'assistant') continue
+    if ('tool_calls' in msg && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true
+    if ('content' in msg && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (typeof block === 'object' && block !== null && 'type' in block && (block.type === 'tool_use' || block.type === 'toolCall')) return true
+      }
+    }
+  }
+  return false
+}
+
+function hasAssistantMessageInHistory(event: unknown): boolean {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return false
+  const payload = (event as { payload?: { messages?: unknown[]; input?: unknown[] } }).payload
+  if (!payload) return false
+  const messages = Array.isArray(payload.messages)
+    ? payload.messages
+    : Array.isArray(payload.input)
+      ? payload.input
+      : []
+  return messages.some((msg) => typeof msg === 'object' && msg !== null && 'role' in msg && msg.role === 'assistant')
+}
+
+function hasToolCallInBranch(sessionManager: SessionManager | undefined): boolean {
+  if (!sessionManager) return false
+  return sessionManager.getBranch().some((entry) => {
+    return entry.type === 'tool_call'
+      || entry.customType === 'tool_call'
+      || entry.type === 'tool_execution_start'
+      || entry.customType === 'tool_execution_start'
+  })
+}
+
+function hasAssistantMessageInBranch(sessionManager: SessionManager | undefined): boolean {
+  if (!sessionManager) return false
+  return sessionManager.getBranch().some((entry) => entry.type === 'assistant_message' || entry.customType === 'assistant_message')
+}
+
 export default function (pi: Pi) {
   pi.registerCommand('dsh-minimal', {
-    description:
-      'Toggle DSH-style minimal mode (single-sentence prompt + xd discovery protocol); `strict` keeps only bash/edit/write/read; `on`/`off`/`minimal`/`strict` set explicitly',
+    description: 'Toggle minimal, strict, or DeepSeek V4 Pro bootstrap mode.',
     handler: (args, ctx) => {
       const next = parseMode(args, readMode(ctx.sessionManager))
-      pi.appendEntry(STATE_ENTRY, { mode: next })
+      pi.appendEntry(STATE_ENTRY, { mode: next, phase: next === 'pro' ? 'bootstrap' : undefined, activeTools: next === 'pro' ? pi.getActiveTools?.() : undefined, promoteOn: next === 'pro' ? 'tool-call' : undefined })
       ctx.ui.notify(modeNotice(next), 'info')
     },
   })
 
   pi.registerTool({
-    name: 'xd',
-    label: 'XD Devices',
-    description:
-      'Discover extra capabilities on demand: read xd:// to list mounted tool devices; read xd://<tool> for each device\'s docs and JSON schema; write the JSON args object to xd://<tool> to execute. Mounted devices: ast_edit, debug, lsp, inspect_image, browser, checkpoint, rewind, skills (skills actions: list/read).',
-    parameters: pi.zod.object({}),
-    loadMode: 'essential',
-    async execute() {
-      return {
-        content: [{ type: 'text', text: 'Use read xd:// to enumerate mounted tool devices, then read xd://<tool> for its docs and schema before writing JSON args to execute it.' }],
+    name: PRO_EDITOR,
+    label: 'String Replace Editor',
+    description: 'View and edit files using view, create, str_replace, and insert commands.',
+    parameters: pi.zod.object({
+      command: pi.zod.enum(['view', 'create', 'str_replace', 'insert']),
+      path: pi.zod.string(),
+      file_text: pi.zod.string().optional(),
+      old_str: pi.zod.string().optional(),
+      new_str: pi.zod.string().optional(),
+      insert_line: pi.zod.number().optional(),
+      view_range: pi.zod.array(pi.zod.number()).optional(),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try { return executeEditor(params as EditorParams, ctx) } catch (error) {
+        return { content: [{ type: 'text', text: String(error instanceof Error ? error.message : error) }], isError: true }
       }
     },
   })
 
   pi.registerTool({
-    name: 'skills',
-    label: 'Skills',
-    description:
-      'List or read available skills. action "list" returns name + description per skill; action "read" returns the SKILL.md body for the given name.',
-    parameters: pi.zod.object({
-      action: pi.zod.enum(['list', 'read']),
-      name: pi.zod.string().optional(),
-    }),
+    name: 'xd', label: 'XD Devices', loadMode: 'essential',
+    description: 'Discover extra capabilities through xd:// devices.',
+    parameters: pi.zod.object({}),
+    async execute() { return { content: [{ type: 'text', text: 'Use read xd:// to enumerate devices.' }] } },
+  })
+
+  pi.registerTool({
+    name: 'skills', label: 'Skills', description: 'List or read available skills.',
+    parameters: pi.zod.object({ action: pi.zod.enum(['list', 'read']), name: pi.zod.string().optional() }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      if (params.action === 'list') {
+      const skillParams = params as ToolParams
+      if (skillParams.action === 'list') {
         const skills = scanSkills(ctx.cwd)
-        return {
-          content: [{ type: 'text', text: renderSkillList(skills) }],
-          details: { skills },
-        }
+        return { content: [{ type: 'text', text: renderSkillList(skills) }], details: { skills } }
       }
-      const skill = scanSkills(ctx.cwd).find((s) => s.name === params.name)
-      if (!skill) {
-        return {
-          content: [{ type: 'text', text: `No skill named "${params.name ?? ''}".` }],
-          isError: true,
-        }
-      }
-      const body = readFileSync(skill.path, 'utf8')
-      return {
-        content: [{ type: 'text', text: body }],
-        details: { name: skill.name },
-      }
+      const skill = scanSkills(ctx.cwd).find((item) => item.name === skillParams.name)
+      if (!skill) return { content: [{ type: 'text', text: `No skill named "${skillParams.name ?? ''}".` }], isError: true }
+      return { content: [{ type: 'text', text: readFileSync(skill.path, 'utf8') }], details: { name: skill.name } }
     },
   })
 
-  pi.on('before_agent_start', (event, ctx) => {
-    // If the user has ever explicitly set dsh-minimal state, respect that
-    // manual state (including an explicit `off`).
+  pi.on('tool_call', async (event, ctx) => {
+    if (readMode(ctx?.sessionManager) !== 'pro') return
+    const state = readProState(ctx?.sessionManager)
+    if (state.phase === 'promoted' || !eventToolName(event)) return
+    const activeTools = state.activeTools ?? pi.getActiveTools?.() ?? []
+    pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools, promoteOn: state.promoteOn ?? 'tool-call' })
+    if (activeTools.length > 0) await pi.setActiveTools?.(activeTools)
+  })
+
+  async function ensureProBootstrap(ctx: Ctx | undefined): Promise<void> {
+    if (readMode(ctx?.sessionManager) !== 'pro') return
+    const state = readProState(ctx?.sessionManager)
+    if (state.phase !== 'bootstrap') return
+    // Restrict active tools to the real DSH Minimal pair. The payload is
+    // replaced with the official byte-identical schemas by applyTools, while
+    // dispatch still reaches the registered bash/str_replace_editor tools.
+    await pi.setActiveTools?.(PRO_BOOTSTRAP_TOOLS)
+  }
+
+  pi.on('before_agent_start', (_event, ctx) => {
     let mode = readMode(ctx?.sessionManager)
-    if (!hasModeEntry(ctx?.sessionManager) && isDeepSeekModel(ctx)) {
-      // No manual state yet: auto-enable minimal mode when a DeepSeek model is used.
-      pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
-      ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
-      mode = 'minimal'
+    if (!hasModeEntry(ctx?.sessionManager)) {
+      if (shouldAutoPro(ctx?.sessionManager, ctx)) {
+        pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'bootstrap', activeTools: pi.getActiveTools?.(), auto: true, promoteOn: 'tool-call' })
+        ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+        mode = 'pro'
+      } else if (isDeepSeekModel(ctx)) {
+        // Keep the existing flash/DeepSeek auto-minimal behavior unchanged.
+        pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
+        ctx?.ui?.notify?.(autoMinimalNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+        mode = 'minimal'
+      }
     }
     if (mode === 'off') return
     return { systemPrompt: MINIMAL_SYSTEM }
   })
 
-  pi.on('before_provider_request', (event, ctx) => {
+  pi.on('before_provider_request', async (event, ctx) => {
     let mode = readMode(ctx?.sessionManager)
-    if (!hasModeEntry(ctx?.sessionManager) && isDeepSeekModel(ctx)) {
-      // Fallback auto-enable for provider requests that bypass before_agent_start.
-      pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
-      ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
-      mode = 'minimal'
+    if (!hasModeEntry(ctx?.sessionManager)) {
+      if (shouldAutoPro(ctx?.sessionManager, ctx)) {
+        pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'bootstrap', activeTools: pi.getActiveTools?.(), auto: true, promoteOn: 'tool-call' })
+        ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+        mode = 'pro'
+      } else if (isDeepSeekModel(ctx)) {
+        // Keep the existing flash/DeepSeek auto-minimal behavior unchanged.
+        pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
+        ctx?.ui?.notify?.(autoMinimalNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+        mode = 'minimal'
+      }
     }
     if (mode === 'off') return
-    // before_agent_start already replaces systemPrompt at the provider-neutral
-    // layer; this payload-level pass is a fallback for flows that bypass that
-    // hook (e.g. side-channel/streaming requests), and also patches tools.
-    applyMode(event, mode)
+    if (mode === 'pro') {
+      const state = readProState(ctx?.sessionManager)
+      const promoteOn = state.promoteOn ?? 'tool-call'
+      const hasTool = hasToolCallInHistory(event) || hasToolCallInBranch(ctx?.sessionManager)
+      const hasAssistant = hasAssistantMessageInHistory(event) || hasAssistantMessageInBranch(ctx?.sessionManager)
+      const shouldPromote = state.phase === 'bootstrap' && (
+        promoteOn === 'tool-call' ? hasTool
+        : promoteOn === 'assistant-message' ? hasAssistant
+        : hasTool || hasAssistant
+      )
+      if (shouldPromote) {
+        // The model already produced an assistant turn (and possibly a tool
+        // call). Promote now so the next request exposes the full real tool set.
+        const activeTools = state.activeTools ?? pi.getActiveTools?.() ?? []
+        pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools, promoteOn })
+        if (activeTools.length > 0) await pi.setActiveTools?.(activeTools)
+      } else {
+        await ensureProBootstrap(ctx)
+      }
+    }
+    applyMode(event, mode, mode === 'pro' ? readProState(ctx?.sessionManager).phase : 'promoted')
   })
 }
