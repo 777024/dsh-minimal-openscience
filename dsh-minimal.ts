@@ -3,22 +3,17 @@
  *
  * `/dsh-minimal` toggles the legacy minimal mode; `strict` narrows tools,
  * and `pro` performs a DeepSeek V4 Pro bootstrap compatible with DSH Minimal:
- * the very first user turn is intercepted and replaced with a short warmup
- * prompt that repeats the one-line system prompt. That warmup turn runs with
- * the DSH Minimal bash/str_replace_editor tool pair.
- *
- * After the warmup run ends the original user prompt is re-sent while the
- * DSH Minimal tool pair is STILL active. The full original omp tool set is
- * restored only after the model makes its first real tool call, so the
- * model's first decision is made against the minimal DSH context.
+ * the first provider request uses the one-line prompt plus payload-only fake
+ * `bash` and `str_replace_editor` tools whose schemas are byte-identical to
+ * the official DSH Minimal preset. Calling either fake tool returns an error
+ * and promotes the session, after which the original omp tool set is restored.
  *
  * The plugin also registers `xd` and `skills` for on-demand capability
- * discovery. Pro mode never injects an extra prime message into the provider
- * payload: the warmup prompt IS the first user message.
+ * discovery. Pro mode never injects an echo/bootstrap hint: strict parity with
+ * DSH Minimal means the first request contains no extra instruction.
  *
  * `before_provider_request` patches provider payloads in place, while session
- * entries persist mode, Pro phase, and the pending warmup prompt across
- * resume/restart.
+ * entries persist mode and Pro phase across resume/restart.
  */
 
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
@@ -26,9 +21,7 @@ import { join, resolve, relative } from 'node:path'
 import { homedir } from 'node:os'
 
 const STATE_ENTRY = 'com.dsh-minimal.state'
-const WARMUP_ENTRY = 'com.dsh-minimal.warmup'
 const MINIMAL_SYSTEM = 'You are a helpful software engineer assistant.'
-const WARMUP_PROMPT = MINIMAL_SYSTEM
 const PRO_EDITOR = 'str_replace_editor'
 
 /** Strict-mode tool allowlist: bash + editing trio + the xd discovery device. */
@@ -196,17 +189,7 @@ function scanSkills(cwd: string): SkillInfo[] {
 interface Entry {
   type: string
   customType?: string
-  message?: { role?: string; content?: unknown; tool_calls?: unknown[] }
-  data?: {
-    mode?: Mode
-    enabled?: boolean
-    auto?: boolean
-    phase?: 'bootstrap' | 'promoted'
-    activeTools?: string[]
-    promoteOn?: 'tool-call' | 'assistant-message' | 'either'
-    warmupPhase?: 'pending' | 'done'
-    prompt?: string
-  }
+  data?: { mode?: Mode; enabled?: boolean; auto?: boolean; phase?: 'bootstrap' | 'promoted'; activeTools?: string[]; promoteOn?: 'tool-call' | 'assistant-message' | 'either' }
 }
 
 interface ToolParams {
@@ -233,7 +216,6 @@ interface Ctx {
   model?: { id?: string; provider?: string; name?: string }
   models?: { current?(): { id?: string; provider?: string; name?: string } | undefined }
   ui?: { notify(text: string, level?: string): unknown }
-  isIdle?(): boolean
 }
 
 interface CommandCtx extends Ctx {
@@ -249,7 +231,7 @@ interface ToolResult {
 }
 
 interface Pi {
-  on(event: string, handler: (event: unknown, ctx?: Ctx) => unknown | Promise<unknown>): unknown
+  on(event: string, handler: (event: unknown, ctx?: Ctx) => void | Promise<void>): unknown
   registerCommand(name: string, def: { description: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }): unknown
   registerTool(def: {
     name: string
@@ -260,9 +242,7 @@ interface Pi {
     execute(id: string, params: ToolParams | EditorParams, signal: unknown, onUpdate: unknown, ctx: ToolContext): Promise<ToolResult>
   }): unknown
   appendEntry(type: string, data: unknown): unknown
-  sendUserMessage?(content: string | unknown[], options?: { deliverAs?: 'steer' | 'followUp' }): void
   getActiveTools?(): string[]
-  getAllTools?(): { name: string }[]
   setActiveTools?(toolNames: string[]): Promise<void>
   zod: {
     object: (shape: Record<string, unknown>) => unknown
@@ -299,32 +279,6 @@ function readProState(sessionManager: SessionManager | undefined): { phase: 'boo
 function hasModeEntry(sessionManager: SessionManager | undefined): boolean {
   return sessionManager?.getBranch().some((entry) => entry.type === 'custom' && entry.customType === STATE_ENTRY) ?? false
 }
-
-function readWarmupState(sessionManager: SessionManager | undefined): { phase?: 'pending' | 'done'; prompt?: string } {
-  let state: { phase?: 'pending' | 'done'; prompt?: string } = {}
-  for (const entry of sessionManager?.getBranch() ?? []) {
-    if (entry.type !== 'custom' || entry.customType !== WARMUP_ENTRY) continue
-    if (entry.data?.warmupPhase === 'pending' || entry.data?.warmupPhase === 'done') {
-      state = { phase: entry.data.warmupPhase, prompt: entry.data.prompt }
-    }
-  }
-  return state
-}
-
-function readWarmupPending(sessionManager: SessionManager | undefined): string | undefined {
-  const state = readWarmupState(sessionManager)
-  return state.phase === 'pending' && typeof state.prompt === 'string' ? state.prompt : undefined
-}
-
-function hasConversationEntries(sessionManager: SessionManager | undefined): boolean {
-  if (!sessionManager) return false
-  return sessionManager.getBranch().some((entry) => {
-    if (entry.type === 'message' || entry.type === 'custom_message') return true
-    const role = entry.message?.role
-    return role === 'user' || role === 'assistant' || role === 'toolResult'
-  })
-}
-
 function isDeepSeekV4Pro(ctx: Ctx | undefined): boolean {
   const model = ctx?.model ?? ctx?.models?.current?.()
   const haystack = [model?.id, model?.provider, model?.name].filter(Boolean).join(' ').toLowerCase()
@@ -339,7 +293,7 @@ function isDeepSeekModel(ctx: Ctx | undefined): boolean {
 }
 
 function autoModeNotice(model: { id?: string; provider?: string; name?: string } | undefined): string {
-  return `dsh-minimal auto-enabled (pro): detected ${model?.id ?? model?.name ?? 'DeepSeek V4 Pro'}, two-stage warmup active`
+  return `dsh-minimal auto-enabled (pro): detected ${model?.id ?? model?.name ?? 'DeepSeek V4 Pro'}, DSH Minimal-compatible bootstrap active`
 }
 
 function autoMinimalNotice(model: { id?: string; provider?: string; name?: string } | undefined): string {
@@ -369,7 +323,7 @@ function parseMode(args: string, current: Mode): Mode {
 function modeNotice(mode: Mode): string {
   if (mode === 'minimal') return `dsh-minimal enabled (minimal): discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
   if (mode === 'strict') return `dsh-minimal strict: only bash/edit/write/read, discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
-  if (mode === 'pro') return `dsh-minimal pro: warmup prompt "${WARMUP_PROMPT}" runs with ${PRO_BOOTSTRAP_TOOLS.join(' + ')}, then the original prompt stays on those tools until the first tool call`
+  if (mode === 'pro') return `dsh-minimal pro: first request uses ${PRO_BOOTSTRAP_TOOLS.join(' + ')}, then restores the original omp tool set`
   return 'dsh-minimal disabled: default system prompt and tool descriptions restored'
 }
 interface ToolLike {
@@ -614,6 +568,35 @@ function stripBootstrapContext(event: unknown): void {
   }
 }
 
+function insertBootstrapPrime(event: unknown): void {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return
+  const payload = event.payload
+  if (typeof payload !== 'object' || payload === null) return
+  const messages = 'messages' in payload && Array.isArray(payload.messages)
+    ? payload.messages
+    : 'input' in payload && Array.isArray(payload.input)
+      ? payload.input
+      : []
+  if (messages.length === 0) return
+  // Only prime the very first request: once an assistant turn exists, stop.
+  const hasAssistant = messages.some((msg) => typeof msg === 'object' && msg !== null && 'role' in msg && msg.role === 'assistant')
+  if (hasAssistant) return
+
+  const isAnthropic = 'system' in payload
+  const prime = isAnthropic
+    ? { role: 'user', content: [{ type: 'text', text: MINIMAL_SYSTEM }] }
+    : { role: 'user', content: MINIMAL_SYSTEM }
+
+  let index = 0
+  while (index < messages.length) {
+    const msg = messages[index]
+    if (typeof msg === 'object' && msg !== null && 'role' in msg && (msg.role === 'system' || msg.role === 'developer')) {
+      index++
+    } else break
+  }
+  messages.splice(index, 0, prime)
+}
+
 function applyTools(event: unknown, mode: Mode, proPhase: 'bootstrap' | 'promoted' = 'promoted'): void {
   if (typeof event !== 'object' || event === null || !('payload' in event)) return
   const payload = event.payload as { tools?: unknown[] }
@@ -627,15 +610,12 @@ function applyTools(event: unknown, mode: Mode, proPhase: 'bootstrap' | 'promote
   if (!('tools' in payload) || !Array.isArray(payload.tools)) return
   let tools = payload.tools
   if (mode === 'strict') {
-    tools = tools.filter((tool): tool is ToolLike => {
-      if (!isToolLike(tool) || typeof tool.name !== 'string') return false
-      return STRICT_TOOLS.has(tool.name.replace(/^_+/, ''))
-    })
+    tools = tools.filter((tool): tool is ToolLike => isToolLike(tool) && typeof tool.name === 'string' && STRICT_TOOLS.has(tool.name))
     payload.tools = tools
   }
   for (const tool of tools) {
     if (!isToolLike(tool) || typeof tool.name !== 'string') continue
-    const short = SHORT_DESCRIPTIONS[tool.name.replace(/^_+/, '')]
+    const short = SHORT_DESCRIPTIONS[tool.name]
     if (short) tool.description = short
   }
 }
@@ -643,6 +623,7 @@ function applyTools(event: unknown, mode: Mode, proPhase: 'bootstrap' | 'promote
 function applyMode(event: unknown, mode: Mode, proPhase: 'bootstrap' | 'promoted' = 'promoted'): void {
   if (mode === 'pro' && proPhase === 'bootstrap') {
     stripBootstrapContext(event)
+    insertBootstrapPrime(event)
   }
   applySystemPrompt(event)
   applyTools(event, mode, proPhase)
@@ -697,39 +678,24 @@ function hasAssistantMessageInHistory(event: unknown): boolean {
 function hasToolCallInBranch(sessionManager: SessionManager | undefined): boolean {
   if (!sessionManager) return false
   return sessionManager.getBranch().some((entry) => {
-    if (entry.type === 'tool_call'
+    return entry.type === 'tool_call'
       || entry.customType === 'tool_call'
       || entry.type === 'tool_execution_start'
-      || entry.customType === 'tool_execution_start') return true
-    const message = entry.message
-    if (message?.role !== 'assistant') return false
-    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) return true
-    if (!Array.isArray(message.content)) return false
-    return message.content.some((block) => {
-      return typeof block === 'object'
-        && block !== null
-        && 'type' in block
-        && (block.type === 'tool_use' || block.type === 'toolCall')
-    })
+      || entry.customType === 'tool_execution_start'
   })
 }
 
 function hasAssistantMessageInBranch(sessionManager: SessionManager | undefined): boolean {
   if (!sessionManager) return false
-  return sessionManager.getBranch().some((entry) => {
-    return entry.type === 'assistant_message'
-      || entry.customType === 'assistant_message'
-      || entry.message?.role === 'assistant'
-  })
+  return sessionManager.getBranch().some((entry) => entry.type === 'assistant_message' || entry.customType === 'assistant_message')
 }
 
 export default function (pi: Pi) {
   pi.registerCommand('dsh-minimal', {
-    description: 'Toggle minimal, strict, or DeepSeek V4 Pro two-stage warmup mode.',
+    description: 'Toggle minimal, strict, or DeepSeek V4 Pro bootstrap mode.',
     handler: (args, ctx) => {
       const next = parseMode(args, readMode(ctx.sessionManager))
       pi.appendEntry(STATE_ENTRY, { mode: next, phase: next === 'pro' ? 'bootstrap' : undefined, activeTools: next === 'pro' ? pi.getActiveTools?.() : undefined, promoteOn: next === 'pro' ? 'tool-call' : undefined })
-      if (next !== 'pro') pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done' })
       ctx.ui.notify(modeNotice(next), 'info')
     },
   })
@@ -776,94 +742,11 @@ export default function (pi: Pi) {
     },
   })
 
-  let warmupImages: unknown[] | undefined
-
-  function allToolNames(): string[] {
-    const all = pi.getAllTools?.() ?? []
-    const names = all
-      .map((tool) => tool.name)
-      .filter((name): name is string => typeof name === 'string')
-    if (names.length > 0) return names
-    return pi.getActiveTools?.() ?? []
-  }
-
-  function resolveMode(ctx: Ctx | undefined): Mode {
-    const mode = readMode(ctx?.sessionManager)
-    if (hasModeEntry(ctx?.sessionManager)) return mode
-    if (shouldAutoPro(ctx?.sessionManager, ctx)) {
-      pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'bootstrap', activeTools: pi.getActiveTools?.(), auto: true, promoteOn: 'tool-call' })
-      ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
-      return 'pro'
-    }
-    if (isDeepSeekModel(ctx)) {
-      // Keep the existing flash/DeepSeek auto-minimal behavior unchanged.
-      pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
-      ctx?.ui?.notify?.(autoMinimalNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
-      return 'minimal'
-    }
-    return mode
-  }
-
-  async function finishWarmup(ctx: Ctx | undefined, deliverAs?: 'steer' | 'followUp'): Promise<void> {
-    const prompt = readWarmupPending(ctx?.sessionManager)
-    if (prompt === undefined) return
-    if (readMode(ctx?.sessionManager) !== 'pro') {
-      pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
-      return
-    }
-    // Keep the Pro state in bootstrap: the original prompt's first request
-    // must still see only the DSH Minimal bash/str_replace_editor pair. The
-    // existing tool_call handler promotes and restores the full tool set only
-    // after the model actually calls one of those DSH tools.
-    pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
-    const content: unknown[] = [{ type: 'text', text: prompt }]
-    if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
-    if (deliverAs) pi.sendUserMessage?.(content, { deliverAs })
-    else pi.sendUserMessage?.(content)
-    warmupImages = undefined
-    ctx?.ui?.notify?.('dsh-minimal pro warmup complete: sending your original prompt with DSH Minimal tools still active', 'info')
-  }
-
-  pi.on('input', (event, ctx) => {
-    const input = event as { text?: unknown; images?: unknown; source?: unknown }
-    // Messages injected by pi.sendUserMessage are the handoff, not a new warmup.
-    if (input.source === 'extension') return
-    const mode = resolveMode(ctx)
-    if (mode !== 'pro') return
-    const warmup = readWarmupState(ctx?.sessionManager)
-    if (warmup.phase === 'done') return
-    if (typeof input.text !== 'string' || input.text.startsWith('/')) return
-    if (warmup.phase === 'pending') {
-      if (!hasConversationEntries(ctx?.sessionManager)) {
-        // Previous warmup never produced a conversation turn; retry with this prompt.
-        pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'pending', prompt: input.text })
-        return { action: 'transform', text: WARMUP_PROMPT }
-      }
-      // Stale pending from an interrupted warmup: discard it so this prompt is never swallowed.
-      pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done' })
-      ctx?.ui?.notify?.('dsh-minimal pro: discarded stale warmup state', 'warning')
-      return
-    }
-    if (hasConversationEntries(ctx?.sessionManager)) return
-    warmupImages = Array.isArray(input.images) ? input.images : undefined
-    pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'pending', prompt: input.text })
-    ctx?.ui?.notify?.(`dsh-minimal pro warmup: running "${WARMUP_PROMPT}" with DSH Minimal tools`, 'info')
-    return { action: 'transform', text: WARMUP_PROMPT }
-  })
-
   pi.on('tool_call', async (event, ctx) => {
     if (readMode(ctx?.sessionManager) !== 'pro') return
-    const toolName = eventToolName(event)
-    if (!toolName) return
-    // During the warmup turn the model must keep seeing only the DSH Minimal
-    // tools. Promotion is deferred to the agent_end handoff.
-    if (readWarmupPending(ctx?.sessionManager) !== undefined) {
-      ctx?.ui?.notify?.(`dsh-minimal pro warmup: ${toolName} detected, deferring promotion until run end`, 'info')
-      return
-    }
     const state = readProState(ctx?.sessionManager)
-    if (state.phase === 'promoted') return
-    const activeTools = Array.isArray(state.activeTools) ? state.activeTools : allToolNames()
+    if (state.phase === 'promoted' || !eventToolName(event)) return
+    const activeTools = state.activeTools ?? pi.getActiveTools?.() ?? []
     pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools, promoteOn: state.promoteOn ?? 'tool-call' })
     if (activeTools.length > 0) await pi.setActiveTools?.(activeTools)
   })
@@ -878,69 +761,57 @@ export default function (pi: Pi) {
     await pi.setActiveTools?.(PRO_BOOTSTRAP_TOOLS)
   }
 
-  pi.on('session_start', (_event, ctx) => {
-    if (readMode(ctx?.sessionManager) !== 'pro') return
-    if (readWarmupPending(ctx?.sessionManager) === undefined) return
-    if (ctx?.isIdle?.() === false) return
-    const model = ctx?.model ?? ctx?.models?.current?.()
-    if (!model) return
-    if (hasAssistantMessageInBranch(ctx?.sessionManager)) {
-      // Warmup finished before a restart: hand off the original prompt now.
-      void finishWarmup(ctx)
-    } else if (!hasConversationEntries(ctx?.sessionManager)) {
-      // Warmup never reached the model: restart it.
-      pi.sendUserMessage?.(WARMUP_PROMPT)
-    }
-  })
-
-  pi.on('agent_end', async (_event, ctx) => {
-    if (readMode(ctx?.sessionManager) !== 'pro') return
-    if (readWarmupPending(ctx?.sessionManager) === undefined) return
-    // The agent loop is still streaming at agent_end, so queue the original
-    // prompt as a follow-up; omp drains it immediately after the warmup run.
-    await finishWarmup(ctx, 'followUp')
-  })
-
-  pi.on('agent_settled', async (_event, ctx) => {
-    if (readMode(ctx?.sessionManager) !== 'pro') return
-    if (readWarmupPending(ctx?.sessionManager) === undefined) return
-    // Compatibility fallback for runtimes that emit agent_settled; pending
-    // state guarantees only one of the two handlers performs the handoff.
-    await finishWarmup(ctx)
-  })
-
   pi.on('before_agent_start', (_event, ctx) => {
-    const mode = resolveMode(ctx)
+    let mode = readMode(ctx?.sessionManager)
+    if (!hasModeEntry(ctx?.sessionManager)) {
+      if (shouldAutoPro(ctx?.sessionManager, ctx)) {
+        pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'bootstrap', activeTools: pi.getActiveTools?.(), auto: true, promoteOn: 'tool-call' })
+        ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+        mode = 'pro'
+      } else if (isDeepSeekModel(ctx)) {
+        // Keep the existing flash/DeepSeek auto-minimal behavior unchanged.
+        pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
+        ctx?.ui?.notify?.(autoMinimalNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+        mode = 'minimal'
+      }
+    }
     if (mode === 'off') return
     return { systemPrompt: MINIMAL_SYSTEM }
   })
 
   pi.on('before_provider_request', async (event, ctx) => {
-    const mode = resolveMode(ctx)
+    let mode = readMode(ctx?.sessionManager)
+    if (!hasModeEntry(ctx?.sessionManager)) {
+      if (shouldAutoPro(ctx?.sessionManager, ctx)) {
+        pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'bootstrap', activeTools: pi.getActiveTools?.(), auto: true, promoteOn: 'tool-call' })
+        ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+        mode = 'pro'
+      } else if (isDeepSeekModel(ctx)) {
+        // Keep the existing flash/DeepSeek auto-minimal behavior unchanged.
+        pi.appendEntry(STATE_ENTRY, { mode: 'minimal', auto: true })
+        ctx?.ui?.notify?.(autoMinimalNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
+        mode = 'minimal'
+      }
+    }
     if (mode === 'off') return
     if (mode === 'pro') {
-      if (readWarmupPending(ctx?.sessionManager) !== undefined) {
-        // Warmup request: stay in DSH Minimal bootstrap mode for the whole turn.
-        await ensureProBootstrap(ctx)
+      const state = readProState(ctx?.sessionManager)
+      const promoteOn = state.promoteOn ?? 'tool-call'
+      const hasTool = hasToolCallInHistory(event) || hasToolCallInBranch(ctx?.sessionManager)
+      const hasAssistant = hasAssistantMessageInHistory(event) || hasAssistantMessageInBranch(ctx?.sessionManager)
+      const shouldPromote = state.phase === 'bootstrap' && (
+        promoteOn === 'tool-call' ? hasTool
+        : promoteOn === 'assistant-message' ? hasAssistant
+        : hasTool || hasAssistant
+      )
+      if (shouldPromote) {
+        // The model already produced an assistant turn (and possibly a tool
+        // call). Promote now so the next request exposes the full real tool set.
+        const activeTools = state.activeTools ?? pi.getActiveTools?.() ?? []
+        pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools, promoteOn })
+        if (activeTools.length > 0) await pi.setActiveTools?.(activeTools)
       } else {
-        const state = readProState(ctx?.sessionManager)
-        const promoteOn = state.promoteOn ?? 'tool-call'
-        const hasTool = hasToolCallInHistory(event) || hasToolCallInBranch(ctx?.sessionManager)
-        const hasAssistant = hasAssistantMessageInHistory(event) || hasAssistantMessageInBranch(ctx?.sessionManager)
-        const shouldPromote = state.phase === 'bootstrap' && (
-          promoteOn === 'tool-call' ? hasTool
-          : promoteOn === 'assistant-message' ? hasAssistant
-          : hasTool || hasAssistant
-        )
-        if (shouldPromote) {
-          // The model already produced an assistant turn (and possibly a tool
-          // call). Promote now so the next request exposes the full real tool set.
-          const activeTools = Array.isArray(state.activeTools) ? state.activeTools : allToolNames()
-          pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools, promoteOn })
-          if (activeTools.length > 0) await pi.setActiveTools?.(activeTools)
-        } else {
-          await ensureProBootstrap(ctx)
-        }
+        await ensureProBootstrap(ctx)
       }
     }
     applyMode(event, mode, mode === 'pro' ? readProState(ctx?.sessionManager).phase : 'promoted')
