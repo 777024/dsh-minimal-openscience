@@ -16,6 +16,12 @@
  * discovery. Pro mode never injects an extra prime message into the provider
  * payload: the warmup prompt IS the first user message.
  *
+ * DeepSeek V4 Pro subagents (task/executor sessions with a session_init
+ * entry) get the same two-stage treatment, initialized from the session_init
+ * task instead of the `input` event: a text-only warmup turn, then the real
+ * assignment inside the cooperative handoff with bash/str_replace_editor +
+ * tool_grant + yield resident. Non-pro subagents are left untouched.
+ *
  * `before_provider_request` patches provider payloads in place, while session
  * entries persist mode, Pro phase, and the pending warmup prompt across
  * resume/restart.
@@ -41,6 +47,12 @@ const PRO_BOOTSTRAP_TOOLS = ['bash', PRO_EDITOR]
 const PRO_RESIDENT_TOOLS = ['bash', PRO_EDITOR, 'tool_grant']
 const TOOL_GRANT_NAME = 'tool_grant'
 const HANDOFF_PREFIX = 'We need to handle the following request together.\n\nCurrently available: bash, str_replace_editor, tool_grant.\nIf you need any other tools, call tool_grant first to discover and unlock them.\n\n'
+
+/** Subagent sessions carry a session_init entry with the original task and the
+ *  tools registered for that agent (read-only agents do not register bash). */
+const SUBAGENT_INIT_ENTRY = 'session_init'
+const SUBAGENT_RESIDENT_CANDIDATES = ['bash', PRO_EDITOR, TOOL_GRANT_NAME, 'yield']
+const SUBAGENT_HANDOFF_BASE = 'We need to handle the following request together.\n\n'
 
 /** Predefined groups for tool_grant. */
 const TOOL_GROUPS: Record<string, string[]> = {
@@ -223,6 +235,14 @@ interface Entry {
     warmupPhase?: 'pending' | 'done'
     prompt?: string
   }
+  agent?: string
+  task?: string
+  tools?: string[]
+  systemPrompt?: string
+  resolvedModel?: string
+  outputSchema?: unknown
+  outputSchemaMode?: string
+  readOnly?: boolean
 }
 
 interface ToolParams {
@@ -252,6 +272,7 @@ interface SessionManager {
 
 interface Ctx {
   sessionManager?: SessionManager
+  hasUI?: boolean
   model?: { id?: string; provider?: string; name?: string }
   models?: { current?(): { id?: string; provider?: string; name?: string } | undefined }
   ui?: { notify(text: string, level?: string): unknown }
@@ -345,6 +366,95 @@ function hasConversationEntries(sessionManager: SessionManager | undefined): boo
     const role = entry.message?.role
     return role === 'user' || role === 'assistant' || role === 'toolResult'
   })
+}
+
+interface SubagentInit {
+  task?: string
+  tools?: string[]
+  agent?: string
+  outputSchema?: unknown
+  outputSchemaMode?: string
+  readOnly?: boolean
+}
+
+function readSubagentInit(sessionManager: SessionManager | undefined): SubagentInit | undefined {
+  if (!sessionManager) return undefined
+  let init: SubagentInit | undefined
+  for (const entry of sessionManager.getBranch()) {
+    if (entry.type !== SUBAGENT_INIT_ENTRY) continue
+    init = {
+      task: typeof entry.task === 'string' ? entry.task : undefined,
+      tools: Array.isArray(entry.tools) ? entry.tools : undefined,
+      agent: typeof entry.agent === 'string' ? entry.agent : undefined,
+      outputSchema: entry.outputSchema,
+      outputSchemaMode: typeof entry.outputSchemaMode === 'string' ? entry.outputSchemaMode : undefined,
+      readOnly: typeof entry.readOnly === 'boolean' ? entry.readOnly : undefined,
+    }
+  }
+  return init
+}
+
+function isSubagentSession(sessionManager: SessionManager | undefined): boolean {
+  return sessionManager?.getBranch().some((entry) => entry.type === SUBAGENT_INIT_ENTRY) ?? false
+}
+
+function subagentAvailableTools(sessionManager: SessionManager | undefined): Set<string> {
+  const tools = readSubagentInit(sessionManager)?.tools ?? []
+  return new Set(tools.map(normalizeToolName))
+}
+
+/** Minimal pair used for the subagent warmup turn. Read-only agents do not
+ *  register bash, so fall back to the DSH Minimal editor alone. */
+function subagentBootstrapTools(sessionManager: SessionManager | undefined): string[] {
+  const available = subagentAvailableTools(sessionManager)
+  const candidates = ['bash', PRO_EDITOR].filter((name) => available.size === 0 || available.has(name))
+  if (candidates.length === 0) candidates.push(PRO_EDITOR)
+  return candidates
+}
+
+/** Resident tool set for a promoted subagent: Minimal pair + tool_grant, plus
+ *  yield because the subagent contract requires it to terminate. Only names
+ *  actually registered for this agent are kept. */
+function subagentResidentTools(sessionManager: SessionManager | undefined): string[] {
+  const available = subagentAvailableTools(sessionManager)
+  const candidates = SUBAGENT_RESIDENT_CANDIDATES.filter((name) => available.size === 0 || available.has(name))
+  return candidates.length > 0 ? candidates : SUBAGENT_RESIDENT_CANDIDATES
+}
+
+function subagentHandoffPrefix(sessionManager: SessionManager | undefined): string {
+  const names = subagentResidentTools(sessionManager)
+  return `${SUBAGENT_HANDOFF_BASE}Currently available: ${names.join(', ')}.\nIf you need any other tools, call tool_grant first to discover and unlock them.\nWhen the assignment is complete, call yield with the final result.\n\n`
+}
+
+/** The task executor prefixes every subagent assignment with a harness
+ *  imperative ("Complete assignment thoroughly"). The cooperative handoff
+ *  mirrors the main-agent recipe better when that wrapper is not re-issued
+ *  inside the "We need..." frame. */
+function subagentAssignmentText(prompt: string): string {
+  return prompt.replace(/^Complete assignment thoroughly:\s*\n+/i, '')
+}
+
+/** Compact yield contract for the subagent's own output schema. The full
+ *  native system prompt is intentionally not sent (it re-opens first-person
+ *  CoT), so the handoff carries just the terminal-call shape the model needs
+ *  to avoid schema retry loops. */
+function subagentYieldContract(sessionManager: SessionManager | undefined): string {
+  const init = readSubagentInit(sessionManager)
+  const schema = init?.outputSchema
+  let shape = 'Call yield with result: {"data": <your final result object>} when the assignment is complete.'
+  if (schema !== null && typeof schema === 'object' && !Array.isArray(schema)) {
+    const record = schema as { type?: unknown; properties?: Record<string, unknown> }
+    if (record.type === 'string') {
+      shape = 'Call yield with result: {"data": "<your final string result>"} when the assignment is complete.'
+    } else if (record.properties && typeof record.properties === 'object') {
+      const keys = Object.keys(record.properties)
+      if (keys.includes('summary') && keys.includes('files') && keys.includes('architecture')) {
+        shape = 'Call yield with result: {"data": {"summary": "...", "files": [{"path": "...", "description": "..."}], "architecture": "..."}} when the assignment is complete.'
+      }
+    }
+  }
+  const readOnly = init?.readOnly === true ? ' This agent is read-only: never create or modify files.' : ''
+  return `${shape}${readOnly}`
 }
 
 function isDeepSeekV4Pro(ctx: Ctx | undefined): boolean {
@@ -584,6 +694,71 @@ function stripInjectedText(text: string): string {
     .replace(/^\s*xd:\/\/skills[^\n]*\n?/gm, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+function messageTextContent(msg: unknown): string {
+  if (typeof msg !== 'object' || msg === null || !('content' in msg)) return ''
+  const content = (msg as { content?: unknown }).content
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((block) => typeof block === 'object' && block !== null && 'type' in block && block.type === 'text' && 'text' in block)
+    .map((block) => String((block as { text?: unknown }).text ?? ''))
+    .join('\n')
+}
+
+/** Subagent warmup must be a text-only anchor turn. Leaving the Minimal pair
+ *  callable occasionally invites endless directory exploration before the
+ *  handoff; forcing tool_choice none keeps the schemas visible but suppresses
+ *  tool calls for exactly this one request. */
+function forceNoToolChoice(event: unknown): void {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return
+  const payload = event.payload
+  if (typeof payload !== 'object' || payload === null) return
+  const kind = detectProviderToolKind(payload)
+  if (kind === 'anthropic') payload.tool_choice = { type: 'none' }
+  else payload.tool_choice = 'none'
+}
+
+function setMessageTextContent(msg: unknown, text: string): void {
+  if (typeof msg !== 'object' || msg === null || !('content' in msg)) return
+  const target = msg as { content?: unknown }
+  if (Array.isArray(target.content)) target.content = [{ type: 'text', text }]
+  else target.content = text
+}
+
+/** The subagent task is already persisted in its own history; this only
+ *  rewrites the outgoing first-turn payload so the model sees the same
+ *  warmup prompt the main agent gets. */
+function replaceSubagentTaskWithWarmup(event: unknown, pendingTask: string): void {
+  replaceSubagentTaskMessage(event, pendingTask, 'last')
+}
+
+/** Rewrites the ORIGINAL task user message (the first one, persisted before
+ *  the warmup turn) to the warmup prompt on the real-task request. Wire
+ *  context then becomes warmup-user -> warmup-assistant -> cooperative
+ *  handoff, exactly like the validated main-agent transcript. */
+function rewriteOriginalSubagentTaskAsWarmup(event: unknown, originalTask: string): void {
+  replaceSubagentTaskMessage(event, originalTask, 'first')
+}
+
+function replaceSubagentTaskMessage(event: unknown, task: string, mode: 'first' | 'last'): void {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return
+  const payload = event.payload
+  if (typeof payload !== 'object' || payload === null) return
+  const messages = 'messages' in payload && Array.isArray(payload.messages)
+    ? payload.messages
+    : 'input' in payload && Array.isArray(payload.input)
+      ? payload.input
+      : []
+  for (let i = mode === 'last' ? messages.length - 1 : 0; mode === 'last' ? i >= 0 : i < messages.length; mode === 'last' ? i-- : i++) {
+    const msg = messages[i]
+    if (typeof msg !== 'object' || msg === null || !('role' in msg) || msg.role !== 'user') continue
+    const text = messageTextContent(msg)
+    if (task && !text.includes(task) && !task.includes(text)) continue
+    setMessageTextContent(msg, WARMUP_PROMPT)
+    return
+  }
 }
 
 function stripBootstrapContext(event: unknown): void {
@@ -842,7 +1017,8 @@ export default function (pi: Pi) {
         const granted = new Set(state.grantedTools ?? [])
         for (const name of unlock) granted.add(name)
         const grantedList = [...granted]
-        const nextActive = [...PRO_RESIDENT_TOOLS, ...grantedList]
+        const resident = isSubagentSession(ctx?.sessionManager) ? subagentResidentTools(ctx?.sessionManager) : PRO_RESIDENT_TOOLS
+        const nextActive = [...resident, ...grantedList]
         pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: nextActive, promoteOn: state.promoteOn ?? 'tool-call', grantedTools: grantedList })
         await pi.setActiveTools?.(nextActive)
         lines.push(`Unlocked for the next request: ${[...unlock].join(', ')}`)
@@ -871,6 +1047,24 @@ export default function (pi: Pi) {
   function resolveMode(ctx: Ctx | undefined): Mode {
     const mode = readMode(ctx?.sessionManager)
     if (hasModeEntry(ctx?.sessionManager)) return mode
+    if (isSubagentSession(ctx?.sessionManager)) {
+      // Subagents never see the interactive `input` event, so the two-stage
+      // warmup is initialized from the session_init contract instead. Only
+      // DeepSeek V4 Pro subagents are rewritten; every other subagent keeps
+      // its native system prompt and full tool set.
+      if (!shouldAutoPro(ctx?.sessionManager, ctx)) return 'off'
+      const init = readSubagentInit(ctx?.sessionManager)
+      pi.appendEntry(STATE_ENTRY, {
+        mode: 'pro',
+        phase: 'bootstrap',
+        activeTools: Array.isArray(init?.tools) ? init.tools : pi.getActiveTools?.(),
+        auto: true,
+        promoteOn: 'tool-call',
+      })
+      if (typeof init?.task === 'string') pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'pending', prompt: init.task })
+      ctx?.ui?.notify?.(`dsh-minimal pro subagent warmup: ${init?.agent ?? 'subagent'} will run the DSH Minimal warmup before its assignment`, 'info')
+      return 'pro'
+    }
     if (shouldAutoPro(ctx?.sessionManager, ctx)) {
       pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'bootstrap', activeTools: pi.getActiveTools?.(), auto: true, promoteOn: 'tool-call' })
       ctx?.ui?.notify?.(autoModeNotice(ctx?.model ?? ctx?.models?.current?.()), 'info')
@@ -891,25 +1085,37 @@ export default function (pi: Pi) {
       pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
       return
     }
+    const subagent = isSubagentSession(ctx?.sessionManager)
+    const resident = subagent ? subagentResidentTools(ctx?.sessionManager) : PRO_RESIDENT_TOOLS
     // Warmup is complete. Promote to the resident tool set (Minimal pair +
-    // tool_grant) and hand the original prompt over inside a short
-    // cooperative frame. All other tools are unlocked on demand via tool_grant.
+    // tool_grant, plus yield for subagents) and hand the original prompt over
+    // inside a short cooperative frame. For subagents the harness wrapper
+    // ("Complete assignment thoroughly") is stripped so the frame opens on
+    // the assignment text itself, and the wire transcript is rewritten to
+    // warmup-user -> warmup-assistant -> cooperative handoff.
     const state = readProState(ctx?.sessionManager)
-    pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: PRO_RESIDENT_TOOLS, promoteOn: state.promoteOn ?? 'tool-call', grantedTools: [] })
+    pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: resident, promoteOn: state.promoteOn ?? 'tool-call', grantedTools: [] })
     pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
-    await pi.setActiveTools?.(PRO_RESIDENT_TOOLS)
-    const content: unknown[] = [{ type: 'text', text: `${HANDOFF_PREFIX}${prompt}` }]
+    await pi.setActiveTools?.(resident)
+    // Mirror the proven main-agent recipe: the follow-up user message starts
+    // with the cooperative "We need..." frame and carries the assignment text
+    // itself (without the harness's "Complete assignment thoroughly" wrapper).
+    const subagentContract = subagent ? `\n\n${subagentYieldContract(ctx?.sessionManager)}` : ''
+    const handoff = subagent ? `${subagentHandoffPrefix(ctx?.sessionManager)}${subagentAssignmentText(prompt)}${subagentContract}` : `${HANDOFF_PREFIX}${prompt}`
+    const content: unknown[] = [{ type: 'text', text: handoff }]
     if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
     if (deliverAs) pi.sendUserMessage?.(content, { deliverAs })
     else pi.sendUserMessage?.(content)
     warmupImages = undefined
-    ctx?.ui?.notify?.(`dsh-minimal pro warmup complete: sending your original prompt with resident tools (${PRO_RESIDENT_TOOLS.join(', ')})`, 'info')
+    ctx?.ui?.notify?.(`dsh-minimal pro warmup complete: sending the assignment with resident tools (${resident.join(', ')})`, 'info')
   }
 
   pi.on('input', (event, ctx) => {
     const input = event as { text?: unknown; images?: unknown; source?: unknown }
     // The handoff message sent by pi.sendUserMessage is not a new user turn.
     if (input.source === 'extension') return
+    // Subagent tasks are injected via session.prompt and never reach `input`.
+    if (isSubagentSession(ctx?.sessionManager)) return
     const mode = resolveMode(ctx)
     if (mode !== 'pro') return
     const warmup = readWarmupState(ctx?.sessionManager)
@@ -950,17 +1156,25 @@ export default function (pi: Pi) {
     if (activeTools.length > 0) await pi.setActiveTools?.(activeTools)
   })
 
-  async function ensureProBootstrap(ctx: Ctx | undefined): Promise<void> {
+  async function ensureProBootstrap(ctx: Ctx | undefined, tools: string[] = PRO_BOOTSTRAP_TOOLS): Promise<void> {
     if (readMode(ctx?.sessionManager) !== 'pro') return
     const state = readProState(ctx?.sessionManager)
     if (state.phase !== 'bootstrap') return
-    // Restrict active tools to the real DSH Minimal pair. The payload is
-    // replaced with the official byte-identical schemas by applyTools, while
-    // dispatch still reaches the registered bash/str_replace_editor tools.
-    await pi.setActiveTools?.(PRO_BOOTSTRAP_TOOLS)
+    // Restrict active tools to the DSH Minimal pair (main) or the subset the
+    // subagent actually registered (read-only agents have no bash). The
+    // payload is replaced with the official byte-identical schemas by
+    // applyPromotedTools, while dispatch still reaches the registered tools.
+    await pi.setActiveTools?.(tools)
   }
 
   pi.on('session_start', (_event, ctx) => {
+    if (isSubagentSession(ctx?.sessionManager)) {
+      // Subagents are started by the task executor before their first prompt.
+      // Resolve mode here so the warmup state exists before before_agent_start
+      // and the provider-request payload is built.
+      resolveMode(ctx)
+      return
+    }
     if (readMode(ctx?.sessionManager) !== 'pro') return
     if (readWarmupPending(ctx?.sessionManager) === undefined) return
     if (ctx?.isIdle?.() === false) return
@@ -973,6 +1187,17 @@ export default function (pi: Pi) {
       // Warmup never reached the model: restart it.
       pi.sendUserMessage?.(WARMUP_PROMPT)
     }
+  })
+
+  pi.on('turn_end', async (_event, ctx) => {
+    if (!isSubagentSession(ctx?.sessionManager)) return
+    if (readMode(ctx?.sessionManager) !== 'pro') return
+    if (readWarmupPending(ctx?.sessionManager) === undefined) return
+    // Subagent prompt() resolves into driveSessionToYield's reminder ladder
+    // very quickly after the turn ends. Queue the handoff follow-up at
+    // turn_end so it is drained before the harness can inject a "no yield"
+    // reminder turn.
+    await finishWarmup(ctx, 'followUp')
   })
 
   pi.on('agent_end', async (_event, ctx) => {
@@ -994,22 +1219,52 @@ export default function (pi: Pi) {
   pi.on('before_agent_start', (_event, ctx) => {
     const mode = resolveMode(ctx)
     if (mode === 'off') return
+    if (isSubagentSession(ctx?.sessionManager)) {
+      // Subagent warmup is handled entirely in before_provider_request: the
+      // warmup request payload gets the one-line system prompt, while the
+      // agent's stored system prompt stays the full subagent contract. That
+      // way the follow-up real-task turn inherits the native prompt again.
+      return
+    }
     return { systemPrompt: MINIMAL_SYSTEM }
   })
 
   pi.on('before_provider_request', async (event, ctx) => {
     const mode = resolveMode(ctx)
     if (mode === 'off') return
+    const subagent = isSubagentSession(ctx?.sessionManager)
     if (mode === 'pro') {
       const state = readProState(ctx?.sessionManager)
       if (state.phase === 'bootstrap') {
-        await ensureProBootstrap(ctx)
+        const bootstrapTools = subagent ? subagentBootstrapTools(ctx?.sessionManager) : PRO_BOOTSTRAP_TOOLS
+        await ensureProBootstrap(ctx, bootstrapTools)
+        if (subagent) {
+          const pending = readWarmupPending(ctx?.sessionManager)
+          applySystemPrompt(event)
+          if (pending !== undefined) replaceSubagentTaskWithWarmup(event, pending)
+          applyPromotedTools(event, new Set(bootstrapTools.map(normalizeToolName)))
+          forceNoToolChoice(event)
+          return
+        }
         applyMode(event, mode, 'bootstrap')
         return
       }
       const granted = Array.isArray(state.grantedTools) ? state.grantedTools : []
-      const allowed = new Set([...PRO_RESIDENT_TOOLS, ...granted].map(normalizeToolName))
-      await pi.setActiveTools?.([...PRO_RESIDENT_TOOLS, ...granted])
+      const resident = subagent ? subagentResidentTools(ctx?.sessionManager) : PRO_RESIDENT_TOOLS
+      const allowed = new Set([...resident, ...granted].map(normalizeToolName))
+      await pi.setActiveTools?.([...resident, ...granted])
+      if (subagent) {
+        // Keep the same wire-level system prompt as the main agent on the
+        // real task turn. The full native subagent contract stays stored in
+        // session_init/history, but sending it re-opens first-person CoT;
+        // the minimized system prompt is the validated "we need" anchor.
+        const originalTask = readSubagentInit(ctx?.sessionManager)?.task
+        if (originalTask !== undefined) rewriteOriginalSubagentTaskAsWarmup(event, originalTask)
+        applySystemPrompt(event)
+        applyPromotedTools(event, allowed)
+        applyTools(event, 'minimal', 'promoted')
+        return
+      }
       applyMode(event, mode, 'promoted')
       applyPromotedTools(event, allowed)
       return
