@@ -7,10 +7,9 @@
  * 1. The first user turn is intercepted and replaced with a short warmup
  *    prompt ("Use bash to echo yes."). The warmup request carries exactly the
  *    DSH Minimal tools: bash + str_replace_editor.
- * 2. After the warmup run ends, the original user prompt is re-sent as a
- *    follow-up. Its first request still carries only the DSH Minimal tools.
- *    The full omp tool set is restored only after the first real tool call
- *    made in that original turn.
+ * 2. After the warmup run ends, the original user prompt is re-sent with the
+ *    full omp tool set restored, so the real request can dispatch subagents,
+ *    search the web, or call any other tool it needs.
  *
  * The plugin also registers `xd` and `skills` for on-demand capability
  * discovery. Pro mode never injects an extra prime message into the provider
@@ -369,7 +368,7 @@ function parseMode(args: string, current: Mode): Mode {
 function modeNotice(mode: Mode): string {
   if (mode === 'minimal') return `dsh-minimal enabled (minimal): discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
   if (mode === 'strict') return `dsh-minimal strict: only bash/edit/write/read, discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
-  if (mode === 'pro') return `dsh-minimal pro: warmup "${WARMUP_PROMPT}" runs with ${PRO_BOOTSTRAP_TOOLS.join(' + ')}, original prompt keeps those tools until its first tool call`
+  if (mode === 'pro') return `dsh-minimal pro: warmup "${WARMUP_PROMPT}" runs with ${PRO_BOOTSTRAP_TOOLS.join(' + ')}, then the original prompt runs with the full omp tool set`
   return 'dsh-minimal disabled: default system prompt and tool descriptions restored'
 }
 interface ToolLike {
@@ -800,16 +799,20 @@ export default function (pi: Pi) {
       pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
       return
     }
-    // Do NOT promote here. The warmup run leaves the DSH Minimal tool pair
-    // active, so the original prompt's first request also sees only those
-    // tools. The tool_call handler promotes after the first real tool call.
+    // Warmup is complete: promote now so the original prompt runs with the
+    // full omp tool set (subagent dispatch, web_search, etc. must be visible
+    // for the real request).
+    const state = readProState(ctx?.sessionManager)
+    const savedTools = Array.isArray(state.activeTools) ? state.activeTools : allToolNames()
+    pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: savedTools, promoteOn: state.promoteOn ?? 'tool-call' })
     pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
+    if (savedTools.length > 0) await pi.setActiveTools?.(savedTools)
     const content: unknown[] = [{ type: 'text', text: prompt }]
     if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
     if (deliverAs) pi.sendUserMessage?.(content, { deliverAs })
     else pi.sendUserMessage?.(content)
     warmupImages = undefined
-    ctx?.ui?.notify?.('dsh-minimal pro warmup complete: sending your original prompt with DSH Minimal tools still active', 'info')
+    ctx?.ui?.notify?.('dsh-minimal pro warmup complete: sending your original prompt with the full omp tool set', 'info')
   }
 
   pi.on('input', (event, ctx) => {
