@@ -7,10 +7,11 @@
  *    system prompt ("You are a helpful software engineer assistant.") while
  *    only the DSH Minimal bash/str_replace_editor pair is exposed.
  * 2. After the warmup run ends, the original user prompt is handed back with
- *    the task-needed tool set (task, hub, web_search) inside a short
- *    cooperative frame ("We need to handle the following request together.").
+ *    the resident tool set (bash, str_replace_editor, tool_grant) inside a
+ *    short cooperative frame ("We need to handle the following request together.").
  *    This keeps the model's CoT in the collaborative "we need / let's" style
- *    while the real request still gets the tools it needs.
+ *    while the real request can unlock every other tool on demand via
+ *    tool_grant.
  * The plugin also registers `xd` and `skills` for on-demand capability
  * discovery. Pro mode never injects an extra prime message into the provider
  * payload: the warmup prompt IS the first user message.
@@ -35,8 +36,21 @@ const STRICT_TOOLS = new Set(['bash', 'edit', 'write', 'read', 'xd'])
 
 /** The official DSH Minimal first-request tool names. */
 const PRO_BOOTSTRAP_TOOLS = ['bash', PRO_EDITOR]
-const PRO_PROMOTE_TOOLS = new Set(['task', 'hub', 'web_search'])
-const HANDOFF_PREFIX = 'We need to handle the following request together.\n\n'
+
+/** Resident tool set after warmup: Minimal pair + the on-demand unlock tool. */
+const PRO_RESIDENT_TOOLS = ['bash', PRO_EDITOR, 'tool_grant']
+const TOOL_GRANT_NAME = 'tool_grant'
+const HANDOFF_PREFIX = 'We need to handle the following request together.\n\nCurrently available: bash, str_replace_editor, tool_grant.\nIf you need any other tools, call tool_grant first to discover and unlock them.\n\n'
+
+/** Predefined groups for tool_grant. */
+const TOOL_GROUPS: Record<string, string[]> = {
+  files: ['read', 'write', 'edit', 'glob', 'grep', 'bash', 'str_replace_editor'],
+  code: ['eval', 'lsp', 'debug', 'ast_edit'],
+  subagent: ['task', 'hub'],
+  research: ['web_search'],
+  project: ['todo', 'workflow', 'checkpoint', 'rewind', 'goal'],
+  browser: ['browser'],
+}
 
 /** Official DSH Minimal persistent-bash JSON schema (transport-neutral). */
 const DSH_MINIMAL_BASH_SCHEMA = {
@@ -205,6 +219,7 @@ interface Entry {
     phase?: 'bootstrap' | 'promoted'
     activeTools?: string[]
     promoteOn?: 'tool-call' | 'assistant-message' | 'either'
+    grantedTools?: string[]
     warmupPhase?: 'pending' | 'done'
     prompt?: string
   }
@@ -213,6 +228,12 @@ interface Entry {
 interface ToolParams {
   action: 'list' | 'read'
   name?: string
+}
+
+interface ToolGrantParams {
+  query?: string
+  tools?: string[]
+  group?: string
 }
 
 interface EditorParams {
@@ -241,7 +262,7 @@ interface CommandCtx extends Ctx {
   ui: { notify(text: string, level?: string): unknown }
 }
 
-interface ToolContext { cwd: string }
+interface ToolContext { cwd: string; sessionManager?: SessionManager }
 
 interface ToolResult {
   content: { type: 'text'; text: string }[]
@@ -263,7 +284,7 @@ interface Pi {
   appendEntry(type: string, data: unknown): unknown
   sendUserMessage?(content: string | unknown[], options?: { deliverAs?: 'steer' | 'followUp' }): void
   getActiveTools?(): string[]
-  getAllTools?(): { name: string }[]
+  getAllTools?(): { name: string; description?: string }[]
   setActiveTools?(toolNames: string[]): Promise<void>
   zod: {
     object: (shape: Record<string, unknown>) => unknown
@@ -287,12 +308,12 @@ function readMode(sessionManager: SessionManager | undefined): Mode {
   return mode
 }
 
-function readProState(sessionManager: SessionManager | undefined): { phase: 'bootstrap' | 'promoted'; activeTools?: string[]; promoteOn?: 'tool-call' | 'assistant-message' | 'either' } {
-  let state: { phase: 'bootstrap' | 'promoted'; activeTools?: string[]; promoteOn?: 'tool-call' | 'assistant-message' | 'either' } = { phase: 'bootstrap' }
+function readProState(sessionManager: SessionManager | undefined): { phase: 'bootstrap' | 'promoted'; activeTools?: string[]; promoteOn?: 'tool-call' | 'assistant-message' | 'either'; grantedTools?: string[] } {
+  let state: { phase: 'bootstrap' | 'promoted'; activeTools?: string[]; promoteOn?: 'tool-call' | 'assistant-message' | 'either'; grantedTools?: string[] } = { phase: 'bootstrap' }
   for (const entry of sessionManager?.getBranch() ?? []) {
     if (entry.type !== 'custom' || entry.customType !== STATE_ENTRY || entry.data?.mode !== 'pro') continue
-    if (entry.data.phase === 'promoted') state = { phase: 'promoted', activeTools: entry.data.activeTools, promoteOn: entry.data.promoteOn }
-    else if (entry.data.phase === 'bootstrap') state = { phase: 'bootstrap', activeTools: entry.data.activeTools, promoteOn: entry.data.promoteOn }
+    if (entry.data.phase === 'promoted') state = { phase: 'promoted', activeTools: entry.data.activeTools, promoteOn: entry.data.promoteOn, grantedTools: entry.data.grantedTools }
+    else if (entry.data.phase === 'bootstrap') state = { phase: 'bootstrap', activeTools: entry.data.activeTools, promoteOn: entry.data.promoteOn, grantedTools: entry.data.grantedTools }
   }
   return state
 }
@@ -370,7 +391,7 @@ function parseMode(args: string, current: Mode): Mode {
 function modeNotice(mode: Mode): string {
   if (mode === 'minimal') return `dsh-minimal enabled (minimal): discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
   if (mode === 'strict') return `dsh-minimal strict: only bash/edit/write/read, discovery protocol active, system prompt is "${MINIMAL_SYSTEM.slice(0, 60)}…"`
-  if (mode === 'pro') return `dsh-minimal pro: warmup "${WARMUP_PROMPT}" runs with ${PRO_BOOTSTRAP_TOOLS.join(' + ')}, then the original prompt runs with ${[...PRO_PROMOTE_TOOLS].join(' + ')} and a cooperative handoff`
+  if (mode === 'pro') return `dsh-minimal pro: warmup "${WARMUP_PROMPT}" runs with ${PRO_BOOTSTRAP_TOOLS.join(' + ')}, then the original prompt runs with ${PRO_RESIDENT_TOOLS.join(' + ')} and a cooperative handoff`
   return 'dsh-minimal disabled: default system prompt and tool descriptions restored'
 }
 interface ToolLike {
@@ -496,73 +517,59 @@ function detectProviderToolKind(payload: unknown): ProviderToolKind {
   return 'unknown'
 }
 
-function buildBootstrapTools(payload: unknown): unknown[] {
+function buildToolEntry(payload: unknown, def: { name: string; description: string; parameters: unknown; input_schema: unknown }): unknown {
   const kind = detectProviderToolKind(payload)
   if (kind === 'openai-completions') {
-    return [
-      {
-        type: 'function',
-        function: {
-          name: DSH_MINIMAL_BASH.name,
-          description: DSH_MINIMAL_BASH.description,
-          parameters: DSH_MINIMAL_BASH.parameters,
-        },
+    return {
+      type: 'function',
+      function: {
+        name: def.name,
+        description: def.description,
+        parameters: def.parameters,
       },
-      {
-        type: 'function',
-        function: {
-          name: DSH_MINIMAL_EDITOR.name,
-          description: DSH_MINIMAL_EDITOR.description,
-          parameters: DSH_MINIMAL_EDITOR.parameters,
-        },
-      },
-    ]
+    }
   }
   if (kind === 'anthropic') {
-    return [
-      {
-        name: DSH_MINIMAL_BASH.name,
-        description: DSH_MINIMAL_BASH.description,
-        input_schema: DSH_MINIMAL_BASH.input_schema,
-      },
-      {
-        name: DSH_MINIMAL_EDITOR.name,
-        description: DSH_MINIMAL_EDITOR.description,
-        input_schema: DSH_MINIMAL_EDITOR.input_schema,
-      },
-    ]
+    return {
+      name: def.name,
+      description: def.description,
+      input_schema: def.input_schema,
+    }
   }
   if (kind === 'openai-responses') {
-    return [
-      {
-        type: 'function',
-        name: DSH_MINIMAL_BASH.name,
-        description: DSH_MINIMAL_BASH.description,
-        parameters: DSH_MINIMAL_BASH.parameters,
-      },
-      {
-        type: 'function',
-        name: DSH_MINIMAL_EDITOR.name,
-        description: DSH_MINIMAL_EDITOR.description,
-        parameters: DSH_MINIMAL_EDITOR.parameters,
-      },
-    ]
+    return {
+      type: 'function',
+      name: def.name,
+      description: def.description,
+      parameters: def.parameters,
+    }
   }
   // Unknown provider: keep both common schema fields so either style can read it.
+  return {
+    name: def.name,
+    description: def.description,
+    parameters: def.parameters,
+    input_schema: def.input_schema,
+  }
+}
+
+function buildBootstrapTools(payload: unknown): unknown[] {
   return [
-    {
-      name: DSH_MINIMAL_BASH.name,
-      description: DSH_MINIMAL_BASH.description,
-      parameters: DSH_MINIMAL_BASH.parameters,
-      input_schema: DSH_MINIMAL_BASH.input_schema,
-    },
-    {
-      name: DSH_MINIMAL_EDITOR.name,
-      description: DSH_MINIMAL_EDITOR.description,
-      parameters: DSH_MINIMAL_EDITOR.parameters,
-      input_schema: DSH_MINIMAL_EDITOR.input_schema,
-    },
+    buildToolEntry(payload, DSH_MINIMAL_BASH),
+    buildToolEntry(payload, DSH_MINIMAL_EDITOR),
   ]
+}
+
+function normalizeToolName(name: string): string {
+  return name.replace(/^_+/, '')
+}
+
+function toolNameOf(tool: unknown): string | undefined {
+  if (typeof tool !== 'object' || tool === null) return undefined
+  const t = tool as { name?: unknown; function?: { name?: unknown } }
+  if (typeof t.name === 'string') return normalizeToolName(t.name)
+  if (typeof t.function?.name === 'string') return normalizeToolName(t.function.name)
+  return undefined
 }
 
 function stripInjectedText(text: string): string {
@@ -640,6 +647,21 @@ function applyTools(event: unknown, mode: Mode, proPhase: 'bootstrap' | 'promote
     const short = SHORT_DESCRIPTIONS[tool.name.replace(/^_+/, '')]
     if (short) tool.description = short
   }
+}
+
+function applyPromotedTools(event: unknown, allowed: Set<string>): void {
+  if (typeof event !== 'object' || event === null || !('payload' in event)) return
+  const payload = event.payload as { tools?: unknown[] }
+  if (typeof payload !== 'object' || payload === null || !Array.isArray(payload.tools)) return
+  const kept: unknown[] = []
+  for (const tool of payload.tools) {
+    const name = toolNameOf(tool)
+    if (!name || !allowed.has(name)) continue
+    if (name === 'bash') kept.push(buildToolEntry(payload, DSH_MINIMAL_BASH))
+    else if (name === PRO_EDITOR) kept.push(buildToolEntry(payload, DSH_MINIMAL_EDITOR))
+    else kept.push(tool)
+  }
+  payload.tools = kept
 }
 
 function applyMode(event: unknown, mode: Mode, proPhase: 'bootstrap' | 'promoted' = 'promoted'): void {
@@ -767,6 +789,74 @@ export default function (pi: Pi) {
     },
   })
 
+  pi.registerTool({
+    name: TOOL_GRANT_NAME,
+    label: 'Tool Grant',
+    description: 'Discover and unlock tools. bash and str_replace_editor are already available; call this to search for or unlock any other tool.',
+    parameters: pi.zod.object({
+      query: pi.zod.string().optional(),
+      tools: pi.zod.array(pi.zod.string()).optional(),
+      group: pi.zod.string().optional(),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const p = params as ToolGrantParams
+      const allTools = pi.getAllTools?.() ?? []
+      const availableNames = new Set(allTools.map((t) => normalizeToolName(t.name)))
+      const lines: string[] = []
+      const query = typeof p.query === 'string' ? p.query.trim().toLowerCase() : ''
+      const requested = Array.isArray(p.tools) ? p.tools.map(normalizeToolName) : []
+      const group = typeof p.group === 'string' ? p.group.trim().toLowerCase() : ''
+
+      if (query) {
+        const tokens = query.split(/\s+/).filter(Boolean)
+        const scored = allTools.map((t) => {
+          const name = normalizeToolName(t.name)
+          const desc = typeof t.description === 'string' ? t.description : SHORT_DESCRIPTIONS[name] ?? ''
+          const groups = Object.entries(TOOL_GROUPS)
+            .filter(([, names]) => names.includes(name))
+            .map(([group]) => group)
+            .join(' ')
+          const haystack = `${name} ${desc} ${groups}`.toLowerCase()
+          const score = tokens.filter((token) => haystack.includes(token)).length
+          return { t, score }
+        }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score)
+        const matches = scored.map((item) => item.t)
+        lines.push(`Matching tools (${matches.length}):`)
+        for (const t of matches.slice(0, 25)) {
+          const name = normalizeToolName(t.name)
+          const desc = (typeof t.description === 'string' ? t.description.split('\n')[0] : SHORT_DESCRIPTIONS[name] ?? '').slice(0, 90)
+          lines.push(`- ${name}: ${desc}`)
+        }
+        if (matches.length === 0) lines.push('No matches. Try another keyword or use group names: ' + Object.keys(TOOL_GROUPS).join(', '))
+        else lines.push('Unlock with tool_grant({"tools": ["<exact name>"]}).')
+      }
+
+      const unlock = new Set<string>()
+      if (group && TOOL_GROUPS[group]) {
+        for (const name of TOOL_GROUPS[group]) if (availableNames.has(name)) unlock.add(name)
+      }
+      for (const name of requested) if (availableNames.has(name)) unlock.add(name)
+
+      if (unlock.size > 0) {
+        const state = readProState(ctx?.sessionManager)
+        const granted = new Set(state.grantedTools ?? [])
+        for (const name of unlock) granted.add(name)
+        const grantedList = [...granted]
+        const nextActive = [...PRO_RESIDENT_TOOLS, ...grantedList]
+        pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: nextActive, promoteOn: state.promoteOn ?? 'tool-call', grantedTools: grantedList })
+        await pi.setActiveTools?.(nextActive)
+        lines.push(`Unlocked for the next request: ${[...unlock].join(', ')}`)
+        lines.push('They will appear in the next provider request.')
+      }
+
+      if (lines.length === 0) {
+        lines.push('Provide `query` to search the catalog, `tools` to unlock exact tools, or `group` to unlock a group.')
+        lines.push('Available groups: ' + Object.keys(TOOL_GROUPS).join(', '))
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] }
+    },
+  })
+
   let warmupImages: unknown[] | undefined
 
   function allToolNames(): string[] {
@@ -801,20 +891,19 @@ export default function (pi: Pi) {
       pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
       return
     }
-    // Warmup is complete. Promote to the task-needed tool set and hand the
-    // original prompt over inside a short cooperative frame.
+    // Warmup is complete. Promote to the resident tool set (Minimal pair +
+    // tool_grant) and hand the original prompt over inside a short
+    // cooperative frame. All other tools are unlocked on demand via tool_grant.
     const state = readProState(ctx?.sessionManager)
-    const savedTools = Array.isArray(state.activeTools) ? state.activeTools : allToolNames()
-    const promoteTools = savedTools.filter((name) => PRO_PROMOTE_TOOLS.has(name))
-    pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: savedTools, promoteOn: state.promoteOn ?? 'tool-call' })
+    pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: PRO_RESIDENT_TOOLS, promoteOn: state.promoteOn ?? 'tool-call', grantedTools: [] })
     pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
-    if (promoteTools.length > 0) await pi.setActiveTools?.(promoteTools)
+    await pi.setActiveTools?.(PRO_RESIDENT_TOOLS)
     const content: unknown[] = [{ type: 'text', text: `${HANDOFF_PREFIX}${prompt}` }]
     if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
     if (deliverAs) pi.sendUserMessage?.(content, { deliverAs })
     else pi.sendUserMessage?.(content)
     warmupImages = undefined
-    ctx?.ui?.notify?.(`dsh-minimal pro warmup complete: sending your original prompt with the task tool set (${promoteTools.join(', ') || 'none'})`, 'info')
+    ctx?.ui?.notify?.(`dsh-minimal pro warmup complete: sending your original prompt with resident tools (${PRO_RESIDENT_TOOLS.join(', ')})`, 'info')
   }
 
   pi.on('input', (event, ctx) => {
@@ -913,10 +1002,18 @@ export default function (pi: Pi) {
     if (mode === 'off') return
     if (mode === 'pro') {
       const state = readProState(ctx?.sessionManager)
-      // Keep bootstrap tools until the tool_call handler promotes. No
-      // history-based promotion here: warmup tool calls must not count.
-      if (state.phase === 'bootstrap') await ensureProBootstrap(ctx)
+      if (state.phase === 'bootstrap') {
+        await ensureProBootstrap(ctx)
+        applyMode(event, mode, 'bootstrap')
+        return
+      }
+      const granted = Array.isArray(state.grantedTools) ? state.grantedTools : []
+      const allowed = new Set([...PRO_RESIDENT_TOOLS, ...granted].map(normalizeToolName))
+      await pi.setActiveTools?.([...PRO_RESIDENT_TOOLS, ...granted])
+      applyMode(event, mode, 'promoted')
+      applyPromotedTools(event, allowed)
+      return
     }
-    applyMode(event, mode, mode === 'pro' ? readProState(ctx?.sessionManager).phase : 'promoted')
+    applyMode(event, mode, 'promoted')
   })
 }
