@@ -83,6 +83,10 @@ The plugin also registers three tools:
 - Subagent sessions use the same main-session `chat.message` flow; there is no omp-specific subagent yield contract.
 - Pro-mode handoff forwards the original text and file parts; the original parts are kept only in memory during the session, not persisted to disk.
 
+## Fix notes
+
+- [compute_job schema 修复记录](COMPUTE_JOB_SCHEMA_FIX.md) — documents the OpenScience `compute_job` schema fix, the patched binary build/install steps, and verification results.
+
 ## License
 
 MIT

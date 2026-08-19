@@ -191,6 +191,12 @@ function resolveMode(sessionID: string, model: unknown): Mode {
   const existing = state.get(sessionID)
   if (existing?.manual) return existing.mode
 
+  if (modelHaystack(model).length === 0) {
+    // Model unknown (e.g. the chat.message hook fires before the model is
+    // resolved). Keep the current mode instead of resetting it to off.
+    return existing?.mode ?? "off"
+  }
+
   const mode = autoMode(model)
   if (!existing) {
     const created: SessionState = {
@@ -284,10 +290,13 @@ function cloneParts(parts: unknown[]): unknown[] {
 
 async function onChatMessage(
   input: { sessionID: string; model?: unknown },
-  output: { message: { tools?: Record<string, boolean> }; parts: unknown[] },
+  output: { message: { model?: unknown; tools?: Record<string, boolean> }; parts: unknown[] },
 ): Promise<void> {
   const sessionID = input.sessionID
-  resolveMode(sessionID, input.model)
+  // The chat.message hook fires before the model is resolved, so input.model
+  // is undefined here. The user message itself carries the model that will be
+  // used for the reply; fall back to it for mode detection.
+  resolveMode(sessionID, input.model ?? output.message.model)
   const current = state.get(sessionID)
   if (!current || current.mode === "off") {
     if (current?.expectSynthetic) {
@@ -310,7 +319,6 @@ async function onChatMessage(
     saveState()
     return
   }
-
   if (current.mode === "pro") {
     if (!current.warmupPrompt) {
       // First real user request: stash the original parts in memory, replace
