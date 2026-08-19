@@ -28,29 +28,37 @@ Automatic mode selection:
 
 ## Installation
 
-Run from this repository:
+Clone or copy this repository anywhere, then run from the repository root:
 
 ```bash
-cd /home/ubuntu/dsh-minimal-openscience && bun add @synsci/plugin zod
-mkdir -p ~/.config/openscience/command && cp command/dsh.md ~/.config/openscience/command/dsh.md
+cd /path/to/dsh-minimal-openscience
+bun add @synsci/plugin zod
+mkdir -p ~/.config/openscience/command
+cp command/dsh.md ~/.config/openscience/command/dsh.md
 ```
 
-Then edit `~/.config/openscience/openscience.jsonc` and add the plugin at the top level:
+Then edit `~/.config/openscience/openscience.jsonc` and add the plugin at the top level. Use the absolute path to `dsh-openscience.ts` in your clone:
 
 ```jsonc
 {
   "$schema": "https://syntheticsciences.ai/config.json",
   "plugin": [
-    "file:///home/ubuntu/dsh-minimal-openscience/dsh-openscience.ts"
+    "file:///absolute/path/to/dsh-minimal-openscience/dsh-openscience.ts"
   ]
 }
+```
+
+To print the exact `file://` URL for your current directory, run:
+
+```bash
+echo "file://$(pwd)/dsh-openscience.ts"
 ```
 
 Restart OpenScience after editing the configuration.
 
 Notes:
 
-- The plugin is referenced by the absolute path above. If you move this repository, update the `plugin` entry in `~/.config/openscience/openscience.jsonc`.
+- OpenScience resolves `file://` plugin entries from the absolute path, so the path must point at your actual clone location.
 - To uninstall, remove the `plugin` entry and delete `~/.config/openscience/command/dsh.md`.
 
 ## Usage
