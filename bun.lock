@@ -1,0 +1,29 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "omp-dsh-minimal",
+      "dependencies": {
+        "@synsci/plugin": "^2.0.27",
+        "zod": "^4.4.3",
+      },
+      "devDependencies": {
+        "@types/node": "^26.2.0",
+      },
+    },
+  },
+  "packages": {
+    "@synsci/plugin": ["@synsci/plugin@2.0.27", "", { "dependencies": { "@synsci/sdk": "2.0.27", "zod": "4.1.8" } }, "sha512-u5mwUYxPujIAlOpPvl0zlyQdidZzqdQxJbjwEDr6XP/XMdJkv5EBuHtKOnlFMX6ln0E3JlwC8r5a5iK2W96QCA=="],
+
+    "@synsci/sdk": ["@synsci/sdk@2.0.27", "", {}, "sha512-hTkRjjq+Xuyy1IEdyUQr7YG/7LKNv2rvAnoCoK3sOHZzrJJAeXo+tDuXhlrpUTe7p0+MnVfsukxQoLoPfnYcfQ=="],
+
+    "@types/node": ["@types/node@26.2.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg=="],
+
+    "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
+
+    "zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
+
+    "@synsci/plugin/zod": ["zod@4.1.8", "", {}, "sha512-5R1P+WwQqmmMIEACyzSvo4JXHY5WiAFHRMg+zBZKgKS+Q1viRa0C1hmUKtHltoIFKtIdki3pRxkmpP74jnNYHQ=="],
+  }
+}
